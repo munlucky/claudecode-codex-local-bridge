@@ -6,6 +6,10 @@ describe('buildRouterTraceContext', () => {
 		const headers = new Headers({
 			'x-request-id': 'req-upstream-123',
 			'x-claude-code-session-id': 'session-1',
+			'x-bridge-session-id': 'bridge-session-1',
+			'x-app': 'claude-code',
+			'x-stainless-runtime': 'node',
+			'x-stainless-package-version': '1.2.3',
 		})
 
 		const context = buildRouterTraceContext({
@@ -28,6 +32,19 @@ describe('buildRouterTraceContext', () => {
 
 		expect(context.router_request_id).toBe('req-upstream-123')
 		expect(context.headers.x_claude_code_session_id).toBe('session-1')
+		expect(context.headers.x_bridge_session_id).toBe('bridge-session-1')
+		expect(context.headers.resolved_session_id).toBe('session-1')
+		expect(context.headers.x_app).toBe('claude-code')
+		expect(context.headers.x_stainless_runtime).toBe('node')
+		expect(context.headers.x_stainless_package_version).toBe('1.2.3')
+		expect(context.header_names).toEqual([
+				'x-app',
+				'x-bridge-session-id',
+				'x-claude-code-session-id',
+				'x-request-id',
+				'x-stainless-package-version',
+			'x-stainless-runtime',
+		])
 		expect(context.tool_names).toEqual(['Read'])
 	})
 
@@ -54,5 +71,21 @@ describe('buildRouterTraceContext', () => {
 
 		expect(rebuilt.router_request_id).toBe(initial.router_request_id)
 		expect(rebuilt.message_count).toBe(1)
+	})
+
+	test('uses bridge session id when Claude session id is missing', () => {
+		const headers = new Headers({
+			'x-bridge-session-id': 'bridge-only-session',
+		})
+
+		const context = buildRouterTraceContext({
+			method: 'POST',
+			path: '/v1/messages',
+			headers,
+		})
+
+		expect(context.headers.x_claude_code_session_id).toBeNull()
+		expect(context.headers.x_bridge_session_id).toBe('bridge-only-session')
+		expect(context.headers.resolved_session_id).toBe('bridge-only-session')
 	})
 })

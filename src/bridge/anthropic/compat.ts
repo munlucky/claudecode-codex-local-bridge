@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type {
 	AnthropicInputContentBlock,
 	AnthropicMessage,
@@ -5,6 +6,7 @@ import type {
 	AnthropicMessagesResponse,
 	AnthropicResponseContentBlock,
 	CodexBridgeDecision,
+	CodexPromptMetrics,
 	CodexTurnResult,
 	JsonObject,
 } from '../../shared/index.js'
@@ -127,6 +129,14 @@ function toContentBlocks(content: AnthropicMessage['content'] | AnthropicMessage
 	return (content ?? []) as AnthropicInputContentBlock[]
 }
 
+function estimateTokensFromText(text: string): number {
+	if (!text) {
+		return 0
+	}
+
+	return Math.max(1, Math.ceil(text.length / 4))
+}
+
 function flattenTextBlocks(blocks: AnthropicInputContentBlock[]): string {
 	return blocks
 		.filter(
@@ -150,6 +160,128 @@ function summarizeJsonValue(value: unknown, limit = 280): string {
 				})()
 
 	return raw.length > limit ? `${raw.slice(0, limit - 3)}...` : raw
+}
+
+function normalizeConversationSeedSegment(value: string): string {
+	return value
+		.toLowerCase()
+		.replace(/routerreq_[a-f0-9-]+/g, 'routerreq')
+		.replace(/toolu_[a-z0-9_-]+/g, 'toolu')
+		.replace(/msg_[a-z0-9_-]+/g, 'msg')
+		.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/g, 'uuid')
+		.replace(/\s+/g, ' ')
+		.trim()
+}
+
+function collectContentSeedSegments(
+	content: AnthropicMessage['content'] | AnthropicMessagesRequest['system'] | undefined,
+): string[] {
+	const segments: string[] = []
+
+	if (!content) {
+		return segments
+	}
+
+	if (typeof content === 'string') {
+		const normalized = normalizeConversationSeedSegment(content)
+		return normalized ? [normalized] : []
+	}
+
+	for (const block of content) {
+		if (block.type === 'text') {
+			const normalized = normalizeConversationSeedSegment(block.text)
+			if (normalized) {
+				segments.push(normalized)
+			}
+			continue
+		}
+
+		if (block.type === 'tool_use') {
+			const normalizedName = normalizeConversationSeedSegment(block.name)
+			const normalizedInput = normalizeConversationSeedSegment(summarizeJsonValue(block.input, 512))
+			if (normalizedName) {
+				segments.push(normalizedName)
+			}
+			if (normalizedInput) {
+				segments.push(normalizedInput)
+			}
+			continue
+		}
+
+		if (block.type === 'tool_result') {
+			const normalized = normalizeConversationSeedSegment(
+				typeof block.content === 'string'
+					? block.content
+					: summarizeJsonValue(block.content, 512),
+			)
+			if (normalized) {
+				segments.push(normalized)
+			}
+		}
+	}
+
+	return segments
+}
+
+export function buildAnonymousConversationSeed(
+	request: AnthropicMessagesRequest,
+): string | null {
+	const firstUserMessage = request.messages.find((message) => message.role === 'user')
+	const systemSegments = collectContentSeedSegments(request.system).slice(0, 2)
+	const firstUserSegments = firstUserMessage
+		? collectContentSeedSegments(firstUserMessage.content).slice(0, 4)
+		: []
+	const segments = [...systemSegments, ...firstUserSegments]
+	const toolNames = (request.tools ?? []).map((tool) => tool.name.toLowerCase())
+	const payload = JSON.stringify({
+		system: systemSegments,
+		first_user: firstUserSegments,
+		tool_names: toolNames,
+		first_user_has_tools: Boolean(
+			firstUserMessage &&
+				Array.isArray(firstUserMessage.content) &&
+				firstUserMessage.content.some(
+					(block) => block.type === 'tool_use' || block.type === 'tool_result',
+				),
+		),
+	})
+
+	if (!segments.length && !toolNames.length) {
+		return null
+	}
+
+	return createHash('sha1').update(payload).digest('hex').slice(0, 16)
+}
+
+export function buildStableBridgeSessionId(
+	userAgent: string | null,
+	workspaceRoot: string,
+	conversationSeed: string | null,
+): string | null {
+	if (!userAgent || !conversationSeed) {
+		return null
+	}
+
+	return `bridge-session-${createHash('sha1')
+		.update(userAgent.toLowerCase())
+		.update('\n')
+		.update(workspaceRoot)
+		.update('\n')
+		.update(conversationSeed)
+		.digest('hex')
+		.slice(0, 24)}`
+}
+
+function summarizeToolSurface(request: AnthropicMessagesRequest): string[] {
+	return [...new Set((request.tools ?? []).map((tool) => tool.name.trim().toLowerCase()))].sort()
+}
+
+export function buildThreadInvariantInput(request: AnthropicMessagesRequest): string {
+	return JSON.stringify({
+		system: request.system ?? null,
+		tool_names: summarizeToolSurface(request),
+		toolLoop: Boolean(request.tools?.length),
+	})
 }
 
 function serializeBlocks(blocks: AnthropicInputContentBlock[]): string {
@@ -351,11 +483,36 @@ export function buildCodexDeveloperInstructions(
 	return lines.join('\n')
 }
 
+function serializeAnthropicMessages(
+	messages: AnthropicMessage[],
+): string[] {
+	const lines: string[] = []
+
+	for (const message of messages) {
+		const blocks = toContentBlocks(message.content)
+		lines.push(`## ${message.role}`)
+		lines.push(serializeBlocks(blocks) || '[empty]')
+		lines.push('')
+	}
+
+	return lines
+}
+
 export function serializeAnthropicRequestToCodexPrompt(
 	request: AnthropicMessagesRequest,
+	options?: {
+		mode?: 'full' | 'delta'
+		replayFromMessageIndex?: number
+	},
 ): string {
+	const promptMode = options?.mode ?? 'full'
+	const replayFromMessageIndex = Math.max(0, options?.replayFromMessageIndex ?? 0)
+	const replayMessages =
+		promptMode === 'delta' ? request.messages.slice(replayFromMessageIndex) : request.messages
 	const lines = [
-		'Anthropic-compatible transcript follows.',
+		promptMode === 'delta'
+			? 'Anthropic-compatible transcript delta follows.'
+			: 'Anthropic-compatible transcript follows.',
 		'Respond as the assistant for the final turn.',
 		toolLoopEnabled(request)
 			? 'Do not execute caller tools directly. Choose the next tool request or final answer and return it as strict JSON.'
@@ -369,15 +526,12 @@ export function serializeAnthropicRequestToCodexPrompt(
 		'Tools:',
 		formatToolDefinitions(request),
 		'',
-		'Conversation:',
+		promptMode === 'delta'
+			? `Conversation delta (messages ${replayFromMessageIndex + 1}-${request.messages.length}):`
+			: 'Conversation:',
 	]
 
-	for (const message of request.messages) {
-		const blocks = toContentBlocks(message.content)
-	lines.push(`## ${message.role}`)
-	lines.push(serializeBlocks(blocks) || '[empty]')
-	lines.push('')
-	}
+	lines.push(...serializeAnthropicMessages(replayMessages))
 
 	const toolGuidance = buildToolMappingGuidance(request)
 	if (toolGuidance.length) {
@@ -412,6 +566,57 @@ export function serializeAnthropicRequestToCodexPrompt(
 	}
 
 	return lines.join('\n')
+}
+
+export function buildCodexPromptMetrics(
+	request: AnthropicMessagesRequest,
+	developerInstructions: string,
+	promptText: string,
+	options?: {
+		promptMode?: 'full' | 'delta'
+		replayFromMessageIndex?: number
+	},
+): CodexPromptMetrics {
+	const promptMode = options?.promptMode ?? 'full'
+	const replayFromMessageIndex = Math.max(0, options?.replayFromMessageIndex ?? 0)
+	const replayMessages =
+		promptMode === 'delta' ? request.messages.slice(replayFromMessageIndex) : request.messages
+	const userMessages = request.messages.filter((message) => message.role === 'user')
+	const systemText = flattenTextBlocks(toContentBlocks(request.system))
+	const toolPayload = JSON.stringify(
+		(request.tools ?? []).map((tool) => ({
+			name: tool.name,
+			description: tool.description ?? '',
+			input_schema: tool.input_schema,
+		})),
+	)
+	const userVisibleText = [
+		systemText,
+		...userMessages.map((message) =>
+			typeof message.content === 'string'
+				? message.content
+				: serializeBlocks(toContentBlocks(message.content)),
+		),
+	]
+		.filter(Boolean)
+		.join('\n\n')
+
+	return {
+		userMessageCount: userMessages.length,
+		totalMessageCount: request.messages.length,
+		newMessageCount: replayMessages.length,
+		systemCharCount: systemText.length,
+		toolCount: request.tools?.length ?? 0,
+		toolNames: (request.tools ?? []).map((tool) => tool.name),
+		toolSchemaCharCount: toolPayload.length,
+		developerInstructionCharCount: developerInstructions.length,
+		promptCharCount: promptText.length,
+		userVisibleCharCount: userVisibleText.length,
+		estimatedPromptTokens: estimateTokensFromText(promptText),
+		estimatedUserVisibleTokens: estimateTokensFromText(userVisibleText),
+		promptMode,
+		replayFromMessageIndex,
+	}
 }
 
 export function collectRequestTextSegments(request: AnthropicMessagesRequest): string[] {

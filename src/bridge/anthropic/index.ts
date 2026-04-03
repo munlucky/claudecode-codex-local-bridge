@@ -1,5 +1,9 @@
 export {
+	buildAnonymousConversationSeed,
 	buildCodexDeveloperInstructions,
+	buildCodexPromptMetrics,
+	buildStableBridgeSessionId,
+	buildThreadInvariantInput,
 	buildToolMappingGuidance,
 	collectRequestTextSegments,
 	extractToolExecutionHints,

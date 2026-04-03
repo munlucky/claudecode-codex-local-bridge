@@ -90,6 +90,39 @@ ROUTER_CAPTURE_REQUESTS=0
 ROUTER_CAPTURE_RESPONSES=0
 ```
 
+### 토큰 분석 로그
+
+요청/응답 캡처 파일(`ROUTER_CAPTURE_REQUESTS_PATH`, `ROUTER_CAPTURE_RESPONSES_PATH`)은 사용자 입력 대비 Codex 전달 토큰의 추이를 분석할 수 있습니다.
+
+- 요청 로그(`anthropic-requests.jsonl`)에는 `anonymous_conversation_seed`와 `tool_names`가 기록됩니다.
+- 응답 로그(`anthropic-responses.jsonl`)에는 Codex 사용량이 기록되며, 주요 필드는 다음과 같습니다.
+  - `usage_input_tokens`
+  - `usage_cached_input_tokens`
+  - `usage_reasoning_output_tokens`
+  - `usage_total_tokens`
+  - `prompt_metrics.estimatedPromptTokens`
+  - `prompt_metrics.estimatedUserVisibleTokens`
+  - `prompt_metrics.promptMode`
+  - `prompt_metrics.replayFromMessageIndex`
+  - `thread_mode`, `thread_reuse_reason`
+
+빠른 분석 예시:
+
+```bash
+# 한 번의 요청에서 사용자 입력(추정) 대비 Codex 입력 토큰 비교
+jq -r '
+  select(.type=="response") |
+  [.timestamp, .router_request_id, .prompt_metrics.estimatedUserVisibleTokens, .usage_input_tokens, .usage_cached_input_tokens, .thread_mode, .thread_reuse_reason]
+  | @tsv
+' .history/anthropic-responses.jsonl | head
+
+# 세션/쓰레드 재사용률 확인
+jq -r '
+  select(.type=="response" and .thread_mode!=null) |
+  .thread_mode
+' .history/anthropic-responses.jsonl | sort | uniq -c
+```
+
 ## API 표면
 
 ### `GET /health`
@@ -118,7 +151,7 @@ ROUTER_CAPTURE_RESPONSES=0
 
 1. Claude Code가 보낸 Anthropic Messages 요청을 받습니다.
 2. 요청 본문을 검증하고 정규화합니다.
-3. `codex app-server`의 `thread/start`로 Codex thread를 시작합니다.
+3. `x-claude-code-session-id`와 workspace가 있으면 기존 Codex app-server 세션과 thread를 재사용하고, 없으면 새 세션을 만들고 `thread/start`를 호출합니다.
 4. `turn/start`로 직렬화된 요청을 Codex에 전달합니다.
 5. 결과를 Anthropic 호환 JSON 또는 SSE로 변환합니다.
 6. 최종 텍스트 응답 또는 다음 `tool_use` 결정을 반환합니다.
@@ -156,7 +189,9 @@ dist/
 - `codex app-server`의 로컬 프로토콜에 의존하며, 공개 안정 API 계약이 아닙니다.
 - 로컬 Codex 인증 기반 브리지 경로만 지원합니다.
 - Inbound Anthropic bearer token은 검증하지 않습니다.
-- 요청마다 새 Codex thread를 만들고, 문맥은 들어온 transcript로 재구성합니다.
+- `x-claude-code-session-id`가 있으면 동일 workspace 안에서 Codex app-server 세션과 thread를 재사용합니다.
+- 구버전 Claude Code처럼 session header가 없는 경우에는 동일 workspace + 동일 CLI user agent + 요청에서 추출한 대화 seed에 대해 짧은 TTL 기반 fallback 재사용을 시도합니다.
+- 재사용된 thread가 더 이상 유효하지 않으면 같은 세션에서 새 thread를 다시 만들고, 세션 자체가 깨졌으면 캐시 세션을 교체합니다.
 
 ## 개발
 

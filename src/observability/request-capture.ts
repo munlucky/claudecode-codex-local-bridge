@@ -1,3 +1,4 @@
+import { buildAnonymousConversationSeed } from '../bridge/anthropic/index.js'
 import { appendFile, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import type { RouterConfig } from '../server/index.js'
@@ -10,6 +11,7 @@ type CapturedAnthropicRequest = {
 	method: string
 	path: string
 	started_at: string
+	header_names: string[]
 	headers: RouterTraceContext['headers']
 	model: string | null
 	stream: boolean | null
@@ -18,6 +20,7 @@ type CapturedAnthropicRequest = {
 	tool_names: string[]
 	tool_choice: unknown
 	tools: unknown
+	anonymous_conversation_seed: string | null
 	body_parse_error?: string
 }
 
@@ -32,6 +35,10 @@ function toCapturedRecord(
 			: {}
 
 	const tools = Array.isArray(payload.tools) ? payload.tools : []
+	const typedRequest =
+		body && typeof body === 'object' && !Array.isArray(body) && Array.isArray(payload.messages)
+			? (body as AnthropicMessagesRequest)
+			: null
 	const toolNames = tools
 		.map((tool) =>
 			tool && typeof tool === 'object' && !Array.isArray(tool) && typeof tool.name === 'string'
@@ -46,6 +53,7 @@ function toCapturedRecord(
 		method: context.method,
 		path: context.path,
 		started_at: context.started_at,
+		header_names: context.header_names,
 		headers: context.headers,
 		model: context.model,
 		stream: context.stream,
@@ -54,6 +62,9 @@ function toCapturedRecord(
 		tool_names: toolNames.length ? toolNames : context.tool_names,
 		tool_choice: payload.tool_choice ?? null,
 		tools,
+		anonymous_conversation_seed: typedRequest
+			? buildAnonymousConversationSeed(typedRequest)
+			: null,
 		...(parseError ? { body_parse_error: parseError } : {}),
 	}
 }
