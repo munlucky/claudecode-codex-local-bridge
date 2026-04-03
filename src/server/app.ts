@@ -184,7 +184,7 @@ export function createApp() {
 		const rawBody = await c.req.text()
 		let requestBody: AnthropicMessagesRequest
 		logRouterLine(
-			`messages begin request_id=${traceContext.router_request_id} session_id=${traceContext.headers.x_claude_code_session_id ?? 'none'} method=${traceContext.method} path=${traceContext.path}`,
+			`messages begin request_id=${traceContext.router_request_id} session_id=${traceContext.headers.resolved_session_id ?? 'none'} method=${traceContext.method} path=${traceContext.path}`,
 		)
 		try {
 			requestBody = requestSchema.parse(JSON.parse(rawBody)) as AnthropicMessagesRequest
@@ -231,13 +231,18 @@ export function createApp() {
 					status: 200,
 					duration_ms: Date.now() - startedAt,
 				})
-				const stream = createAnthropicStream(config, requestBody, {
+				const codexContext = {
+					sessionId: traceContext.headers.resolved_session_id,
+					routerRequestId: traceContext.router_request_id,
+					userAgent: traceContext.headers.user_agent,
+				}
+				const stream = createAnthropicStream(config, requestBody, codexContext, {
 					onSessionReady: async (metadata) => {
 						logRouterLine(
-							`stream session_ready request_id=${traceContext.router_request_id} conversation_id=${metadata.threadId} model=${metadata.model}`,
+							`stream session_ready request_id=${traceContext.router_request_id} conversation_id=${metadata.threadId} model=${metadata.model} workspace_root=${JSON.stringify(metadata.workspaceRoot)} thread_mode=${metadata.threadMode} thread_reuse_reason=${metadata.threadReuseReason} thread_cache_key=${metadata.threadCacheKey ?? 'none'}`,
 						)
 					},
-					onComplete: async ({ stopReason, usage, decision, metadata }) => {
+					onComplete: async ({ stopReason, usage, promptMetrics, decision, metadata }) => {
 						await captureRouterStreamEvent(config, traceContext, {
 							stream_phase: 'completed',
 							status: 200,
@@ -245,13 +250,22 @@ export function createApp() {
 							stream_end_reason: stopReason,
 							codex_model: metadata.model,
 							conversation_id: metadata.threadId,
+							workspace_root: metadata.workspaceRoot,
+							thread_mode: metadata.threadMode,
+							thread_reuse_reason: metadata.threadReuseReason,
+							thread_cache_key: metadata.threadCacheKey,
 							usage_output_tokens: usage.outputTokens,
+							usage_input_tokens: usage.inputTokens,
+							usage_cached_input_tokens: usage.cachedInputTokens,
+							usage_reasoning_output_tokens: usage.reasoningOutputTokens,
+							usage_total_tokens: usage.totalTokens,
+							prompt_metrics: promptMetrics,
 							decision_kind: decision?.kind ?? null,
 							tool_use_name:
 								decision?.kind === 'tool_use' ? decision.name : null,
 						})
 						logRouterLine(
-							`stream completed request_id=${traceContext.router_request_id} conversation_id=${metadata.threadId} end_reason=${stopReason} tool=${decision?.kind === 'tool_use' ? decision.name : 'none'} output_tokens=${usage.outputTokens}`,
+							`stream completed request_id=${traceContext.router_request_id} conversation_id=${metadata.threadId} end_reason=${stopReason} tool=${decision?.kind === 'tool_use' ? decision.name : 'none'} output_tokens=${usage.outputTokens} thread_mode=${metadata.threadMode} thread_reuse_reason=${metadata.threadReuseReason}`,
 						)
 					},
 					onError: async ({ error, metadata }) => {
@@ -264,9 +278,13 @@ export function createApp() {
 							error_message: message,
 							codex_model: metadata?.model ?? null,
 							conversation_id: metadata?.threadId ?? null,
+							workspace_root: metadata?.workspaceRoot ?? null,
+							thread_mode: metadata?.threadMode ?? null,
+							thread_reuse_reason: metadata?.threadReuseReason ?? null,
+							thread_cache_key: metadata?.threadCacheKey ?? null,
 						})
 						logRouterLine(
-							`stream failed request_id=${traceContext.router_request_id} conversation_id=${metadata?.threadId ?? 'none'} error=${JSON.stringify(message)}`,
+							`stream failed request_id=${traceContext.router_request_id} conversation_id=${metadata?.threadId ?? 'none'} error=${JSON.stringify(message)} thread_mode=${metadata?.threadMode ?? 'none'} thread_reuse_reason=${metadata?.threadReuseReason ?? 'none'}`,
 						)
 					},
 					onCancel: async ({ metadata }) => {
@@ -277,9 +295,13 @@ export function createApp() {
 							stream_end_reason: 'cancelled',
 							codex_model: metadata?.model ?? null,
 							conversation_id: metadata?.threadId ?? null,
+							workspace_root: metadata?.workspaceRoot ?? null,
+							thread_mode: metadata?.threadMode ?? null,
+							thread_reuse_reason: metadata?.threadReuseReason ?? null,
+							thread_cache_key: metadata?.threadCacheKey ?? null,
 						})
 						logRouterLine(
-							`stream cancelled request_id=${traceContext.router_request_id} conversation_id=${metadata?.threadId ?? 'none'}`,
+							`stream cancelled request_id=${traceContext.router_request_id} conversation_id=${metadata?.threadId ?? 'none'} thread_mode=${metadata?.threadMode ?? 'none'} thread_reuse_reason=${metadata?.threadReuseReason ?? 'none'}`,
 						)
 					},
 				})
@@ -294,7 +316,11 @@ export function createApp() {
 				})
 			}
 
-			const result = await executeCodexTurn(config, requestBody)
+			const result = await executeCodexTurn(config, requestBody, {
+				sessionId: traceContext.headers.resolved_session_id,
+				routerRequestId: traceContext.router_request_id,
+				userAgent: traceContext.headers.user_agent,
+			})
 			const anthropicResponse = mapCodexResultToAnthropic(result, requestBody.model)
 			c.header('X-Router-Request-Id', traceContext.router_request_id)
 			await captureRouterResponse(config, traceContext, {
@@ -302,13 +328,23 @@ export function createApp() {
 				duration_ms: Date.now() - startedAt,
 				stop_reason: anthropicResponse.stop_reason,
 				codex_model: result.model,
+				conversation_id: result.metadata?.threadId ?? null,
+				workspace_root: result.metadata?.workspaceRoot ?? null,
+				thread_mode: result.metadata?.threadMode ?? null,
+				thread_reuse_reason: result.metadata?.threadReuseReason ?? null,
+				thread_cache_key: result.metadata?.threadCacheKey ?? null,
 				usage_output_tokens: result.usage.outputTokens,
+				usage_input_tokens: result.usage.inputTokens,
+				usage_cached_input_tokens: result.usage.cachedInputTokens,
+				usage_reasoning_output_tokens: result.usage.reasoningOutputTokens,
+				usage_total_tokens: result.usage.totalTokens,
+				prompt_metrics: result.promptMetrics,
 				decision_kind: result.decision?.kind ?? null,
 				tool_use_name:
 					result.decision?.kind === 'tool_use' ? result.decision.name : null,
 			})
 			logRouterLine(
-				`messages completed request_id=${traceContext.router_request_id} status=200 stop_reason=${anthropicResponse.stop_reason ?? 'null'} duration_ms=${Date.now() - startedAt}`,
+				`messages completed request_id=${traceContext.router_request_id} status=200 stop_reason=${anthropicResponse.stop_reason ?? 'null'} duration_ms=${Date.now() - startedAt} conversation_id=${result.metadata?.threadId ?? 'none'} thread_mode=${result.metadata?.threadMode ?? 'none'} thread_reuse_reason=${result.metadata?.threadReuseReason ?? 'none'}`,
 			)
 			return c.json(anthropicResponse)
 		} catch (error) {

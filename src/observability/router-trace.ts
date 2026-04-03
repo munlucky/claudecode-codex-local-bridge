@@ -3,7 +3,10 @@ import { dirname } from 'node:path'
 import type { RouterConfig } from '../server/index.js'
 import type {
 	AnthropicMessagesRequest,
+	CodexPromptMetrics,
 	CodexBridgeDecision,
+	CodexThreadMode,
+	CodexThreadReuseReason,
 } from '../shared/index.js'
 
 export interface RouterTraceContext {
@@ -11,11 +14,24 @@ export interface RouterTraceContext {
 	method: string
 	path: string
 	started_at: string
+	header_names: string[]
 	headers: {
 		user_agent: string | null
 		anthropic_beta: string | null
 		x_claude_code_session_id: string | null
+		x_bridge_session_id: string | null
+		authorization_bridge_session_id: string | null
+		resolved_session_id: string | null
 		x_request_id: string | null
+		x_app: string | null
+		x_stainless_arch: string | null
+		x_stainless_lang: string | null
+		x_stainless_os: string | null
+		x_stainless_package_version: string | null
+		x_stainless_retry_count: string | null
+		x_stainless_runtime: string | null
+		x_stainless_runtime_version: string | null
+		x_stainless_timeout: string | null
 	}
 	model: string | null
 	stream: boolean | null
@@ -32,7 +48,16 @@ export interface RouterResponseTrace {
 	error_message?: string
 	codex_model?: string | null
 	usage_output_tokens?: number | null
+	usage_input_tokens?: number | null
+	usage_cached_input_tokens?: number | null
+	usage_reasoning_output_tokens?: number | null
+	usage_total_tokens?: number | null
+	prompt_metrics?: CodexPromptMetrics
 	conversation_id?: string | null
+	workspace_root?: string | null
+	thread_mode?: CodexThreadMode | null
+	thread_reuse_reason?: CodexThreadReuseReason | null
+	thread_cache_key?: string | null
 	stream_end_reason?: string | null
 	decision_kind?: CodexBridgeDecision['kind'] | null
 	tool_use_name?: string | null
@@ -41,6 +66,26 @@ export interface RouterResponseTrace {
 function getHeader(headers: Headers, key: string): string | null {
 	const value = headers.get(key)
 	return value && value.trim() ? value.trim() : null
+}
+
+function parseAuthorizationBridgeSessionId(value: string | null): string | null {
+	if (!value) {
+		return null
+	}
+
+	const [scheme, token] = value.split(/\s+/, 2)
+	if (scheme?.toLowerCase() !== 'bearer' || !token) {
+		return null
+	}
+
+	const marker = '__bridge_session__'
+	const index = token.lastIndexOf(marker)
+	if (index < 0) {
+		return null
+	}
+
+	const sessionId = token.slice(index + marker.length).trim()
+	return sessionId || null
 }
 
 export function buildRouterTraceContext(input: {
@@ -53,6 +98,11 @@ export function buildRouterTraceContext(input: {
 	const request = input.request
 	const tools = Array.isArray(request?.tools) ? request.tools : []
 	const upstreamRequestId = getHeader(input.headers, 'x-request-id')
+	const claudeCodeSessionId = getHeader(input.headers, 'x-claude-code-session-id')
+	const bridgeSessionId = getHeader(input.headers, 'x-bridge-session-id')
+	const authorizationBridgeSessionId = parseAuthorizationBridgeSessionId(
+		getHeader(input.headers, 'authorization'),
+	)
 
 	return {
 		router_request_id:
@@ -60,11 +110,31 @@ export function buildRouterTraceContext(input: {
 		method: input.method,
 		path: input.path,
 		started_at: new Date().toISOString(),
+		header_names: [...input.headers.keys()].sort(),
 		headers: {
 			user_agent: getHeader(input.headers, 'user-agent'),
 			anthropic_beta: getHeader(input.headers, 'anthropic-beta'),
-			x_claude_code_session_id: getHeader(input.headers, 'x-claude-code-session-id'),
+			x_claude_code_session_id: claudeCodeSessionId,
+			x_bridge_session_id: bridgeSessionId,
+			authorization_bridge_session_id: authorizationBridgeSessionId,
+			resolved_session_id:
+				claudeCodeSessionId ?? bridgeSessionId ?? authorizationBridgeSessionId,
 			x_request_id: upstreamRequestId,
+			x_app: getHeader(input.headers, 'x-app'),
+			x_stainless_arch: getHeader(input.headers, 'x-stainless-arch'),
+			x_stainless_lang: getHeader(input.headers, 'x-stainless-lang'),
+			x_stainless_os: getHeader(input.headers, 'x-stainless-os'),
+			x_stainless_package_version: getHeader(
+				input.headers,
+				'x-stainless-package-version',
+			),
+			x_stainless_retry_count: getHeader(input.headers, 'x-stainless-retry-count'),
+			x_stainless_runtime: getHeader(input.headers, 'x-stainless-runtime'),
+			x_stainless_runtime_version: getHeader(
+				input.headers,
+				'x-stainless-runtime-version',
+			),
+			x_stainless_timeout: getHeader(input.headers, 'x-stainless-timeout'),
 		},
 		model: typeof request?.model === 'string' ? request.model : null,
 		stream: typeof request?.stream === 'boolean' ? request.stream : null,
@@ -113,6 +183,15 @@ export async function captureRouterStreamEvent(
 		error_message?: string
 		codex_model?: string | null
 		conversation_id?: string | null
+		workspace_root?: string | null
+		thread_mode?: CodexThreadMode | null
+		thread_reuse_reason?: CodexThreadReuseReason | null
+		thread_cache_key?: string | null
+		usage_input_tokens?: number | null
+		usage_cached_input_tokens?: number | null
+		usage_reasoning_output_tokens?: number | null
+		usage_total_tokens?: number | null
+		prompt_metrics?: CodexPromptMetrics
 		usage_output_tokens?: number | null
 		decision_kind?: CodexBridgeDecision['kind'] | null
 		tool_use_name?: string | null

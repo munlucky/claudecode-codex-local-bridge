@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { loadConfig } from '../../../src/server/index.js'
 import {
+	buildAnonymousConversationSeed,
 	buildCodexDeveloperInstructions,
 	buildToolMappingGuidance,
 	collectRequestTextSegments,
@@ -274,5 +275,70 @@ describe('Anthropic/Codex mapping', () => {
 		expect(guidance.some((line) => line.includes("'Grep'"))).toBe(true)
 		expect(guidance.some((line) => line.includes("'Bash'"))).toBe(true)
 		expect(guidance.some((line) => line.includes("'ToolSearch'"))).toBe(true)
+	})
+
+	test('anonymous conversation seed is stable for equivalent prompts', () => {
+		const seedA = buildAnonymousConversationSeed({
+			model: 'claude-sonnet-4-6',
+			max_tokens: 1024,
+			system: 'You are helpful.',
+			messages: [
+				{
+					role: 'user',
+					content:
+						'Please inspect routerreq_123e4567-e89b-12d3-a456-426614174000 and continue.',
+				},
+			],
+			tools: [{ name: 'Read', input_schema: {} }],
+		})
+
+		const seedB = buildAnonymousConversationSeed({
+			model: 'claude-sonnet-4-6',
+			max_tokens: 1024,
+			system: '  you are helpful. ',
+			messages: [
+				{
+					role: 'user',
+					content:
+						'Please inspect routerreq_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee and continue.',
+				},
+			],
+			tools: [{ name: 'Read', input_schema: {} }],
+		})
+
+		const seedC = buildAnonymousConversationSeed({
+			model: 'claude-sonnet-4-6',
+			max_tokens: 1024,
+			system: 'You are helpful.',
+			messages: [{ role: 'user', content: 'Please inspect a different task.' }],
+			tools: [{ name: 'Read', input_schema: {} }],
+		})
+
+		expect(seedA).toBe(seedB)
+		expect(seedC).not.toBe(seedA)
+	})
+
+	test('anonymous conversation seed stays stable as later turns are appended', () => {
+		const seedInitial = buildAnonymousConversationSeed({
+			model: 'claude-sonnet-4-6',
+			max_tokens: 1024,
+			system: 'You are helpful.',
+			messages: [{ role: 'user', content: 'Investigate the bridge runtime issue.' }],
+			tools: [{ name: 'Read', input_schema: {} }],
+		})
+
+		const seedLater = buildAnonymousConversationSeed({
+			model: 'claude-sonnet-4-6',
+			max_tokens: 1024,
+			system: 'You are helpful.',
+			messages: [
+				{ role: 'user', content: 'Investigate the bridge runtime issue.' },
+				{ role: 'assistant', content: 'I will inspect the logs.' },
+				{ role: 'user', content: 'Here are more logs and a new stack trace.' },
+			],
+			tools: [{ name: 'Read', input_schema: {} }],
+		})
+
+		expect(seedLater).toBe(seedInitial)
 	})
 })

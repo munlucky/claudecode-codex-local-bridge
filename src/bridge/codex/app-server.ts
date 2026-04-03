@@ -1,8 +1,13 @@
+import { createHash } from 'node:crypto'
 import { existsSync, lstatSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import {
+	buildAnonymousConversationSeed,
+	buildCodexPromptMetrics,
 	buildCodexDeveloperInstructions,
+	buildStableBridgeSessionId,
+	buildThreadInvariantInput,
 	collectRequestTextSegments,
 	parseCodexBridgeDecision,
 	resolveModelAlias,
@@ -15,6 +20,9 @@ import type {
 	CodexTokenUsage,
 	CodexTurnResult,
 	CodexBridgeDecision,
+	CodexPromptMetrics,
+	CodexTurnMetadata,
+	CodexThreadReuseReason,
 	JsonValue,
 } from '../../shared/index.js'
 
@@ -30,9 +38,10 @@ type PendingRequest = {
 	timeout: Timer
 }
 
-export interface CodexTurnMetadata {
-	threadId: string
-	workspaceRoot: string
+export interface CodexRequestContext {
+	sessionId?: string | null
+	routerRequestId?: string | null
+	userAgent?: string | null
 }
 
 export interface StreamLifecycleLogger {
@@ -40,6 +49,7 @@ export interface StreamLifecycleLogger {
 	onComplete?: (payload: {
 		stopReason: 'end_turn' | 'tool_use'
 		usage: CodexTokenUsage
+		promptMetrics: CodexPromptMetrics
 		finalText: string
 		decision: CodexBridgeDecision | null
 		metadata: CodexTurnMetadata & { model: string }
@@ -61,6 +71,265 @@ const ZERO_USAGE: CodexTokenUsage = {
 	totalTokens: 0,
 }
 
+const THREAD_CACHE_LIMIT = 128
+const SESSION_CACHE_IDLE_TTL_MS = 60 * 60 * 1000
+const ANONYMOUS_THREAD_TTL_MS = 30 * 60 * 1000
+const EPHEMERAL_SESSION_TTL_MS = 30 * 60 * 1000
+
+type ThreadCacheRecord = {
+	session: CodexAppServerSession
+	threadId: string
+	model: string
+	reasoningEffort: string | null
+	fingerprint: string
+	lastMessageCount: number
+	transcriptHash: string
+	updatedAt: number
+	busy: boolean
+	waiters: Array<() => void>
+	idleTimer: Timer | null
+	ttlMs: number
+}
+
+type EphemeralSessionRecord = {
+	sessionId: string
+	updatedAt: number
+	idleTimer: Timer | null
+}
+
+type PreparedSession = {
+	session: CodexAppServerSession
+	threadId: string
+	model: string
+	reasoningEffort: string | null
+	promptText: string
+	promptMetrics: CodexPromptMetrics
+	workspaceRoot: string
+	metadata: CodexTurnMetadata
+	requestContext: Required<CodexRequestContext>
+	cacheRecord: ThreadCacheRecord | null
+	cacheKey: string | null
+	cleanup: () => Promise<void>
+}
+
+const threadCache = new Map<string, ThreadCacheRecord>()
+const pendingThreadCacheCreates = new Map<string, Promise<ThreadCacheRecord>>()
+const ephemeralSessionCache = new Map<string, EphemeralSessionRecord>()
+
+function hashMessages(messages: AnthropicMessagesRequest['messages']): string {
+	return createHash('sha1').update(JSON.stringify(messages)).digest('hex')
+}
+
+function updateThreadCacheProgress(
+	cacheKey: string | null,
+	record: ThreadCacheRecord | null,
+	messages: AnthropicMessagesRequest['messages'],
+) {
+	if (!cacheKey || !record) {
+		return
+	}
+
+	record.lastMessageCount = messages.length
+	record.transcriptHash = hashMessages(messages)
+	record.updatedAt = Date.now()
+	upsertThreadCache(cacheKey, record)
+}
+
+function normalizeRequestContext(context?: CodexRequestContext): Required<CodexRequestContext> {
+	return {
+		sessionId: context?.sessionId?.trim() || null,
+		routerRequestId: context?.routerRequestId?.trim() || null,
+		userAgent: context?.userAgent?.trim() || null,
+	}
+}
+
+export function buildThreadCacheKey(sessionId: string | null, workspaceRoot: string): string | null {
+	return sessionId ? `${workspaceRoot}::${sessionId}` : null
+}
+
+export function buildAnonymousThreadCacheKey(
+	userAgent: string | null,
+	workspaceRoot: string,
+	conversationSeed: string | null,
+): string | null {
+	return userAgent && conversationSeed
+		? `anonymous::${workspaceRoot}::${userAgent.toLowerCase()}::${conversationSeed}`
+		: null
+}
+
+function buildEphemeralSessionScopeKey(
+	userAgent: string | null,
+	workspaceRoot: string,
+): string | null {
+	return userAgent ? `ephemeral::${workspaceRoot}::${userAgent.toLowerCase()}` : null
+}
+
+export function buildThreadFingerprint(
+	targetModel: string,
+	sandboxMode: RouterConfig['codexSandboxMode'],
+	threadInvariantInput: string,
+): string {
+	return createHash('sha1')
+		.update(targetModel)
+		.update('\n')
+		.update(sandboxMode)
+		.update('\n')
+		.update(threadInvariantInput)
+		.digest('hex')
+}
+
+function upsertThreadCache(cacheKey: string, record: ThreadCacheRecord) {
+	threadCache.delete(cacheKey)
+	threadCache.set(cacheKey, record)
+
+	if (threadCache.size <= THREAD_CACHE_LIMIT) {
+		return
+	}
+
+	for (const [oldestKey, oldestRecord] of threadCache.entries()) {
+		if (oldestKey === cacheKey || oldestRecord.busy) {
+			continue
+		}
+
+		void closeThreadCacheRecord(oldestKey, oldestRecord)
+		break
+	}
+}
+
+function clearIdleTimer(record: ThreadCacheRecord) {
+	if (!record.idleTimer) {
+		return
+	}
+
+	clearTimeout(record.idleTimer)
+	record.idleTimer = null
+}
+
+function clearEphemeralSessionIdleTimer(record: EphemeralSessionRecord) {
+	if (!record.idleTimer) {
+		return
+	}
+
+	clearTimeout(record.idleTimer)
+	record.idleTimer = null
+}
+
+function scheduleEphemeralSessionEviction(scopeKey: string, record: EphemeralSessionRecord) {
+	clearEphemeralSessionIdleTimer(record)
+	record.idleTimer = setTimeout(() => {
+		clearEphemeralSessionIdleTimer(record)
+		if (ephemeralSessionCache.get(scopeKey) === record) {
+			ephemeralSessionCache.delete(scopeKey)
+		}
+	}, EPHEMERAL_SESSION_TTL_MS)
+}
+
+function getOrCreateEphemeralSessionId(
+	userAgent: string | null,
+	workspaceRoot: string,
+): string | null {
+	const scopeKey = buildEphemeralSessionScopeKey(userAgent, workspaceRoot)
+	if (!scopeKey) {
+		return null
+	}
+
+	const now = Date.now()
+	const cached = ephemeralSessionCache.get(scopeKey)
+	if (cached && now - cached.updatedAt <= EPHEMERAL_SESSION_TTL_MS) {
+		cached.updatedAt = now
+		scheduleEphemeralSessionEviction(scopeKey, cached)
+		return cached.sessionId
+	}
+
+	if (cached) {
+		clearEphemeralSessionIdleTimer(cached)
+		ephemeralSessionCache.delete(scopeKey)
+	}
+
+	const record: EphemeralSessionRecord = {
+		sessionId: `bridge-ephemeral-${crypto.randomUUID()}`,
+		updatedAt: now,
+		idleTimer: null,
+	}
+	ephemeralSessionCache.set(scopeKey, record)
+	scheduleEphemeralSessionEviction(scopeKey, record)
+	return record.sessionId
+}
+
+async function closeThreadCacheRecord(cacheKey: string, record: ThreadCacheRecord) {
+	clearIdleTimer(record)
+	if (threadCache.get(cacheKey) === record) {
+		threadCache.delete(cacheKey)
+	}
+	if (pendingThreadCacheCreates.get(cacheKey)) {
+		pendingThreadCacheCreates.delete(cacheKey)
+	}
+	record.busy = false
+	while (record.waiters.length > 0) {
+		record.waiters.shift()?.()
+	}
+	record.session.close()
+}
+
+function scheduleIdleEviction(cacheKey: string, record: ThreadCacheRecord) {
+	clearIdleTimer(record)
+	record.idleTimer = setTimeout(() => {
+		void closeThreadCacheRecord(cacheKey, record)
+	}, record.ttlMs)
+}
+
+async function waitForThreadCacheRecord(record: ThreadCacheRecord) {
+	if (!record.busy) {
+		return
+	}
+
+	await new Promise<void>((resolve) => {
+		record.waiters.push(resolve)
+	})
+}
+
+async function releaseThreadCacheRecord(cacheKey: string, record: ThreadCacheRecord) {
+	record.updatedAt = Date.now()
+	record.busy = false
+	const waiter = record.waiters.shift()
+	if (waiter) {
+		waiter()
+		return
+	}
+
+	scheduleIdleEviction(cacheKey, record)
+}
+
+function logBridgeThreadEvent(
+	event: string,
+	input: {
+		requestContext: Required<CodexRequestContext>
+		metadata: CodexTurnMetadata
+		model: string
+		extra?: Record<string, string | null | undefined>
+	},
+) {
+	const pairs = [
+		`request_id=${input.requestContext.routerRequestId ?? 'none'}`,
+		`session_id=${input.requestContext.sessionId ?? 'none'}`,
+		`conversation_id=${input.metadata.threadId}`,
+		`workspace_root=${JSON.stringify(input.metadata.workspaceRoot)}`,
+		`model=${input.model}`,
+		`thread_mode=${input.metadata.threadMode}`,
+		`thread_reuse_reason=${input.metadata.threadReuseReason}`,
+		`thread_cache_key=${input.metadata.threadCacheKey ?? 'none'}`,
+		`thread_fingerprint=${input.metadata.threadFingerprint}`,
+	]
+
+	for (const [key, value] of Object.entries(input.extra ?? {})) {
+		if (value !== undefined) {
+			pairs.push(`${key}=${value ?? 'null'}`)
+		}
+	}
+
+	console.log(`[router] ${new Date().toISOString()} ${event} ${pairs.join(' ')}`)
+}
+
 function createDeferred<T>() {
 	let resolve!: (value: T) => void
 	let reject!: (reason?: unknown) => void
@@ -69,6 +338,17 @@ function createDeferred<T>() {
 		reject = rej
 	})
 	return { promise, resolve, reject }
+}
+
+function onceAsync(action: () => Promise<void>): () => Promise<void> {
+	let called = false
+	return async () => {
+		if (called) {
+			return
+		}
+		called = true
+		await action()
+	}
 }
 
 function getObject(value: unknown): Record<string, unknown> | null {
@@ -392,29 +672,51 @@ class CodexAppServerSession {
 		this.failAll(new Error('codex app-server 세션이 종료되었습니다.'))
 		this.process.kill()
 	}
+
+	isClosed() {
+		return this.closed
+	}
 }
 
-async function createPreparedSession(
+async function startThread(
+	session: CodexAppServerSession,
 	config: RouterConfig,
-	request: AnthropicMessagesRequest,
-): Promise<{
-	session: CodexAppServerSession
-	threadId: string
-	model: string
-	reasoningEffort: string | null
-	workspaceRoot: string
-	cleanup: () => Promise<void>
-}> {
-	if (config.codexAuthMode !== 'local_auth_json') {
-		throw new AuthConfigurationError(
-			'이 프로젝트는 CODEX_AUTH_MODE=local_auth_json 전용으로 동작합니다.',
-		)
+	input: {
+		workspaceRoot: string
+		targetModel: string
+		developerInstructions: string
+	},
+) {
+	const threadStart = await session.request(
+		'thread/start',
+		{
+			model: input.targetModel,
+			cwd: input.workspaceRoot,
+			approvalPolicy: 'never',
+			sandbox: buildSandboxPolicy(config.codexSandboxMode),
+			baseInstructions:
+				'You are serving as an Anthropic-compatible backend through a local bridge.',
+			developerInstructions: input.developerInstructions,
+		},
+		config.codexInitTimeoutMs,
+	)
+
+	const thread = getObject(threadStart.thread)
+	const threadId = getString(thread?.id)
+	if (!threadId) {
+		throw new Error('thread/start 응답에 thread.id 가 없습니다.')
 	}
 
-	await requireCodexLocalAuthFile(config.codexAuthFile)
-	await mkdir(config.codexRuntimeCwd, { recursive: true })
-	const workspaceRoot = inferWorkspaceRoot(config, request)
+	return {
+		threadId,
+		model: getString(threadStart.model) ?? input.targetModel,
+		reasoningEffort: getString(threadStart.reasoningEffort),
+	}
+}
 
+async function createCachedSession(
+	config: RouterConfig,
+): Promise<CodexAppServerSession> {
 	const session = await CodexAppServerSession.create(config)
 	const authStatus = await session.request(
 		'getAuthStatus',
@@ -430,35 +732,336 @@ async function createPreparedSession(
 		throw new AuthConfigurationError('Codex local auth 상태가 활성화되어 있지 않습니다.')
 	}
 
-	const targetModel = resolveModelAlias(config, request.model)
-	const threadStart = await session.request(
-		'thread/start',
-		{
-			model: targetModel,
-			cwd: workspaceRoot,
-			approvalPolicy: 'never',
-			sandbox: buildSandboxPolicy(config.codexSandboxMode),
-			baseInstructions:
-				'You are serving as an Anthropic-compatible backend through a local bridge.',
-			developerInstructions: buildCodexDeveloperInstructions(request),
-		},
-		config.codexInitTimeoutMs,
-	)
+	return session
+}
 
-	const thread = getObject(threadStart.thread)
-	const threadId = getString(thread?.id)
-	if (!threadId) {
+async function createThreadCacheRecord(
+	config: RouterConfig,
+	input: {
+		cacheKey: string
+		workspaceRoot: string
+		targetModel: string
+		developerInstructions: string
+		threadFingerprint: string
+		lastMessageCount: number
+		transcriptHash: string
+		ttlMs: number
+	},
+): Promise<ThreadCacheRecord> {
+	const session = await createCachedSession(config)
+	try {
+		const started = await startThread(session, config, {
+			workspaceRoot: input.workspaceRoot,
+			targetModel: input.targetModel,
+			developerInstructions: input.developerInstructions,
+		})
+		const record: ThreadCacheRecord = {
+			session,
+			threadId: started.threadId,
+			model: started.model,
+			reasoningEffort: started.reasoningEffort,
+			fingerprint: input.threadFingerprint,
+			lastMessageCount: input.lastMessageCount,
+			transcriptHash: input.transcriptHash,
+			updatedAt: Date.now(),
+			busy: true,
+			waiters: [],
+			idleTimer: null,
+			ttlMs: input.ttlMs,
+		}
+		upsertThreadCache(input.cacheKey, record)
+		return record
+	} catch (error) {
 		session.close()
-		throw new Error('thread/start 응답에 thread.id 가 없습니다.')
+		throw error
+	}
+}
+
+async function acquireOrCreateThreadCacheRecord(
+	config: RouterConfig,
+	input: {
+		cacheKey: string
+		workspaceRoot: string
+		targetModel: string
+		developerInstructions: string
+		threadFingerprint: string
+		lastMessageCount: number
+		transcriptHash: string
+		ttlMs: number
+	},
+): Promise<{ record: ThreadCacheRecord; reuseReason: CodexThreadReuseReason }> {
+	let sawExpired = false
+	while (true) {
+		const cached = threadCache.get(input.cacheKey) ?? null
+		if (cached) {
+			const expired = Date.now() - cached.updatedAt > cached.ttlMs
+			if (cached.session.isClosed() || expired) {
+				sawExpired ||= expired
+				await closeThreadCacheRecord(input.cacheKey, cached)
+			} else if (cached.busy) {
+				await waitForThreadCacheRecord(cached)
+			} else {
+				clearIdleTimer(cached)
+				cached.busy = true
+				cached.updatedAt = Date.now()
+				upsertThreadCache(input.cacheKey, cached)
+				return {
+					record: cached,
+					reuseReason: expired ? 'cache_expired' : 'cache_hit',
+				}
+			}
+			continue
+		}
+
+		const pending = pendingThreadCacheCreates.get(input.cacheKey)
+		if (pending) {
+			const record = await pending
+			if (record.busy) {
+				await waitForThreadCacheRecord(record)
+				continue
+			}
+			clearIdleTimer(record)
+			record.busy = true
+			record.updatedAt = Date.now()
+			upsertThreadCache(input.cacheKey, record)
+			return {
+				record,
+				reuseReason: 'cache_hit',
+			}
+		}
+
+		const createPromise = createThreadCacheRecord(config, input)
+		pendingThreadCacheCreates.set(input.cacheKey, createPromise)
+		try {
+			const record = await createPromise
+			return {
+				record,
+				reuseReason: sawExpired ? 'cache_expired' : 'cache_miss',
+			}
+		} finally {
+			if (pendingThreadCacheCreates.get(input.cacheKey) === createPromise) {
+				pendingThreadCacheCreates.delete(input.cacheKey)
+			}
+		}
+	}
+}
+
+async function createPreparedSession(
+	config: RouterConfig,
+	request: AnthropicMessagesRequest,
+	context?: CodexRequestContext,
+	options?: {
+		forceFreshThread?: boolean
+	},
+): Promise<PreparedSession> {
+	if (config.codexAuthMode !== 'local_auth_json') {
+		throw new AuthConfigurationError(
+			'이 프로젝트는 CODEX_AUTH_MODE=local_auth_json 전용으로 동작합니다.',
+		)
 	}
 
-	return {
-		session,
-		threadId,
-		model: getString(threadStart.model) ?? targetModel,
-		reasoningEffort: getString(threadStart.reasoningEffort),
+	await requireCodexLocalAuthFile(config.codexAuthFile)
+	await mkdir(config.codexRuntimeCwd, { recursive: true })
+	const workspaceRoot = inferWorkspaceRoot(config, request)
+	const requestContext = normalizeRequestContext(context)
+	const targetModel = resolveModelAlias(config, request.model)
+	const developerInstructions = buildCodexDeveloperInstructions(request)
+	const threadInvariantInput = buildThreadInvariantInput(request)
+	const threadFingerprint = buildThreadFingerprint(
+		targetModel,
+		config.codexSandboxMode,
+		threadInvariantInput,
+	)
+	const conversationSeed = buildAnonymousConversationSeed(request)
+	const explicitSessionId = requestContext.sessionId
+	const ephemeralSessionId =
+		explicitSessionId
+			? null
+			: buildStableBridgeSessionId(requestContext.userAgent, workspaceRoot, conversationSeed) ??
+				getOrCreateEphemeralSessionId(requestContext.userAgent, workspaceRoot)
+	const effectiveSessionId = explicitSessionId ?? ephemeralSessionId
+	const effectiveRequestContext = {
+		...requestContext,
+		sessionId: effectiveSessionId,
+	}
+	const threadCacheKey =
+		buildThreadCacheKey(effectiveSessionId, workspaceRoot) ??
+		buildAnonymousThreadCacheKey(
+			requestContext.userAgent,
+			workspaceRoot,
+			conversationSeed,
+		)
+	const cacheTtlMs =
+		explicitSessionId ? SESSION_CACHE_IDLE_TTL_MS : ANONYMOUS_THREAD_TTL_MS
+	const transcriptHash = hashMessages(request.messages)
+	if (!threadCacheKey) {
+		const promptText = serializeAnthropicRequestToCodexPrompt(request)
+		const promptMetrics = buildCodexPromptMetrics(request, developerInstructions, promptText)
+		const session = await createCachedSession(config)
+		try {
+			const started = await startThread(session, config, {
+				workspaceRoot,
+				targetModel,
+				developerInstructions,
+			})
+			const metadata: CodexTurnMetadata = {
+				threadId: started.threadId,
+				workspaceRoot,
+				sessionId: effectiveSessionId,
+				threadMode: 'new',
+				threadReuseReason: 'no_session',
+				threadCacheKey: null,
+				threadFingerprint,
+			}
+			logBridgeThreadEvent('thread_started', {
+				requestContext: effectiveRequestContext,
+				metadata,
+				model: started.model,
+			})
+			return {
+				session,
+				threadId: started.threadId,
+				model: started.model,
+				reasoningEffort: started.reasoningEffort,
+				promptText,
+				promptMetrics,
+				workspaceRoot,
+				metadata,
+				requestContext: effectiveRequestContext,
+				cacheRecord: null,
+				cacheKey: null,
+				cleanup: onceAsync(async () => {
+					session.close()
+				}),
+			}
+		} catch (error) {
+			session.close()
+			throw error
+		}
+	}
+
+	const { record, reuseReason } = await acquireOrCreateThreadCacheRecord(config, {
+		cacheKey: threadCacheKey,
 		workspaceRoot,
-		cleanup: async () => {},
+		targetModel,
+		developerInstructions,
+		threadFingerprint,
+		lastMessageCount: request.messages.length,
+		transcriptHash,
+		ttlMs: cacheTtlMs,
+	})
+
+	const canReplayDelta =
+		record.lastMessageCount > 0 &&
+		request.messages.length >= record.lastMessageCount &&
+		hashMessages(request.messages.slice(0, record.lastMessageCount)) === record.transcriptHash
+	const shouldReuseThread =
+		!options?.forceFreshThread && record.fingerprint === threadFingerprint
+	const replayFromMessageIndex = shouldReuseThread && canReplayDelta ? record.lastMessageCount : 0
+	const promptMode = replayFromMessageIndex > 0 ? 'delta' : 'full'
+	const promptText = serializeAnthropicRequestToCodexPrompt(request, {
+		mode: promptMode,
+		replayFromMessageIndex,
+	})
+	const promptMetrics = buildCodexPromptMetrics(request, developerInstructions, promptText, {
+		promptMode,
+		replayFromMessageIndex,
+	})
+
+	if (shouldReuseThread) {
+		const metadata: CodexTurnMetadata = {
+			threadId: record.threadId,
+			workspaceRoot,
+			sessionId: effectiveSessionId,
+			threadMode: reuseReason === 'cache_hit' ? 'reused' : 'new',
+			threadReuseReason: reuseReason,
+			threadCacheKey,
+			threadFingerprint,
+		}
+		logBridgeThreadEvent(
+			metadata.threadMode === 'reused' ? 'thread_reused' : 'thread_started',
+			{
+				requestContext: effectiveRequestContext,
+				metadata,
+				model: record.model,
+			},
+		)
+		return {
+			session: record.session,
+			threadId: record.threadId,
+			model: record.model,
+			reasoningEffort: record.reasoningEffort,
+			promptText,
+			promptMetrics,
+			workspaceRoot,
+			metadata,
+			requestContext: effectiveRequestContext,
+			cacheRecord: record,
+			cacheKey: threadCacheKey,
+			cleanup: onceAsync(async () => {
+				await releaseThreadCacheRecord(threadCacheKey, record)
+			}),
+		}
+	}
+
+	const replacedThreadId = record.threadId
+	try {
+		const started = await startThread(record.session, config, {
+			workspaceRoot,
+			targetModel,
+			developerInstructions,
+		})
+		record.threadId = started.threadId
+		record.model = started.model
+		record.reasoningEffort = started.reasoningEffort
+		record.fingerprint = threadFingerprint
+		record.lastMessageCount = request.messages.length
+		record.transcriptHash = transcriptHash
+		record.updatedAt = Date.now()
+		upsertThreadCache(threadCacheKey, record)
+
+		const metadata: CodexTurnMetadata = {
+			threadId: started.threadId,
+			workspaceRoot,
+			sessionId: effectiveSessionId,
+			threadMode: options?.forceFreshThread ? 'recreated' : 'new',
+			threadReuseReason: options?.forceFreshThread ? 'retry_after_error' : 'fingerprint_mismatch',
+			threadCacheKey,
+			threadFingerprint,
+		}
+		logBridgeThreadEvent(
+			metadata.threadMode === 'recreated' ? 'thread_recreated' : 'thread_started',
+			{
+				requestContext: effectiveRequestContext,
+				metadata,
+				model: started.model,
+				extra: {
+					replaced_thread_id: replacedThreadId,
+				},
+			},
+		)
+		return {
+			session: record.session,
+			threadId: started.threadId,
+			model: started.model,
+			reasoningEffort: started.reasoningEffort,
+			promptText,
+			promptMetrics: buildCodexPromptMetrics(request, developerInstructions, promptText, {
+				promptMode,
+				replayFromMessageIndex,
+			}),
+			workspaceRoot,
+			metadata,
+			requestContext: effectiveRequestContext,
+			cacheRecord: record,
+			cacheKey: threadCacheKey,
+			cleanup: onceAsync(async () => {
+				await releaseThreadCacheRecord(threadCacheKey, record)
+			}),
+		}
+	} catch (error) {
+		await closeThreadCacheRecord(threadCacheKey, record)
+		throw error
 	}
 }
 
@@ -475,18 +1078,42 @@ function normalizeEffort(value: string | null): string {
 	}
 }
 
+class FreshThreadRetryRequiredError extends Error {
+	constructor(message: string) {
+		super(message)
+		this.name = 'FreshThreadRetryRequiredError'
+	}
+}
+
+function shouldRetryWithFreshThread(prepared: PreparedSession): boolean {
+	return prepared.metadata.threadMode === 'reused'
+}
+
+function createRetryError(prepared: PreparedSession, error: unknown): FreshThreadRetryRequiredError {
+	const message = error instanceof Error ? error.message : String(error)
+	logBridgeThreadEvent('thread_reuse_failed', {
+		requestContext: prepared.requestContext,
+		metadata: prepared.metadata,
+		model: prepared.model,
+		extra: {
+			error: JSON.stringify(message),
+		},
+	})
+	return new FreshThreadRetryRequiredError(message)
+}
+
 function buildTurnStartParams(
 	threadId: string,
 	reasoningEffort: string | null,
 	config: RouterConfig,
-	request: AnthropicMessagesRequest,
+	promptText: string,
 ): Record<string, unknown> {
 	return {
 		threadId,
 		input: [
 			{
 				type: 'text',
-				text: serializeAnthropicRequestToCodexPrompt(request),
+				text: promptText,
 			},
 		],
 		approvalPolicy: 'never',
@@ -501,21 +1128,28 @@ function createResult(
 	text: string,
 	usage: CodexTokenUsage,
 	decision: CodexBridgeDecision | null,
+	metadata: CodexTurnMetadata,
+	promptMetrics: CodexPromptMetrics,
 ): CodexTurnResult {
 	return {
 		id: `msg_${crypto.randomUUID()}`,
 		model,
 		text,
 		usage,
+		promptMetrics,
 		decision,
+		metadata: {
+			...metadata,
+			model,
+		},
 	}
 }
 
-export async function executeCodexTurn(
+async function executePreparedTurn(
 	config: RouterConfig,
 	request: AnthropicMessagesRequest,
+	prepared: PreparedSession,
 ): Promise<CodexTurnResult> {
-	const prepared = await createPreparedSession(config, request)
 	let finalText = ''
 	const usage = { ...ZERO_USAGE }
 	const structuredToolLoop = Boolean(request.tools?.length)
@@ -547,27 +1181,38 @@ export async function executeCodexTurn(
 			if (method === 'turn/completed') {
 				unsubscribe()
 				const decision = parseCodexBridgeDecision(finalText, request)
+				updateThreadCacheProgress(prepared.cacheKey, prepared.cacheRecord, request.messages)
 				completed.resolve(
 					createResult(
 						prepared.model,
 						finalText,
 						usage,
 						structuredToolLoop ? decision : null,
+						prepared.metadata,
+						prepared.promptMetrics,
 					),
 				)
 			}
 		})
 
-		await prepared.session.request(
-			'turn/start',
-			buildTurnStartParams(
-				prepared.threadId,
-				prepared.reasoningEffort,
-				config,
-				request,
-			),
-			config.codexInitTimeoutMs,
-		)
+		try {
+			await prepared.session.request(
+				'turn/start',
+				buildTurnStartParams(
+					prepared.threadId,
+					prepared.reasoningEffort,
+					config,
+					prepared.promptText,
+				),
+				config.codexInitTimeoutMs,
+			)
+		} catch (error) {
+			unsubscribe()
+			if (shouldRetryWithFreshThread(prepared)) {
+				throw createRetryError(prepared, error)
+			}
+			throw error
+		}
 
 		return await Promise.race([
 			completed.promise,
@@ -579,17 +1224,37 @@ export async function executeCodexTurn(
 			),
 		])
 	} finally {
-		prepared.session.close()
 		await prepared.cleanup()
+	}
+}
+
+export async function executeCodexTurn(
+	config: RouterConfig,
+	request: AnthropicMessagesRequest,
+	context?: CodexRequestContext,
+): Promise<CodexTurnResult> {
+	try {
+		const prepared = await createPreparedSession(config, request, context)
+		return await executePreparedTurn(config, request, prepared)
+	} catch (error) {
+		if (!(error instanceof FreshThreadRetryRequiredError)) {
+			throw error
+		}
+
+		const prepared = await createPreparedSession(config, request, context, {
+			forceFreshThread: true,
+		})
+		return executePreparedTurn(config, request, prepared)
 	}
 }
 
 export function createCodexAnthropicStream(
 	config: RouterConfig,
 	request: AnthropicMessagesRequest,
+	context?: CodexRequestContext,
 	logger?: StreamLifecycleLogger,
 ): ReadableStream<Uint8Array> {
-	let prepared: Awaited<ReturnType<typeof createPreparedSession>> | null = null
+	let prepared: PreparedSession | null = null
 	let unsubscribe: (() => void) | null = null
 	let streamClosed = false
 	let keepAliveTimer: Timer | null = null
@@ -633,173 +1298,247 @@ export function createCodexAnthropicStream(
 					safeEnqueue(formatSseComment('keepalive'))
 				}, 5000)
 
-				prepared = await createPreparedSession(config, request)
-				await logger?.onSessionReady?.({
-					threadId: prepared.threadId,
-					workspaceRoot: prepared.workspaceRoot,
-					model: prepared.model,
-				})
-				if (
-					!safeEnqueue(
-					formatSse('message_start', {
-						type: 'message_start',
-						message: {
-							id: `msg_${crypto.randomUUID()}`,
-							type: 'message',
-							role: 'assistant',
+				for (const forceFreshThread of [false, true]) {
+					usage = { ...ZERO_USAGE }
+					textStarted = false
+					streamedText = ''
+					finalText = ''
+
+					try {
+						prepared = await createPreparedSession(
+							config,
+							request,
+							context,
+							forceFreshThread ? { forceFreshThread: true } : undefined,
+						)
+						await logger?.onSessionReady?.({
+							...prepared.metadata,
 							model: prepared.model,
-							content: [],
-							stop_reason: null,
-							stop_sequence: null,
-							usage: {
-								input_tokens: 0,
-								output_tokens: 0,
-							},
-						},
-					}),
-					)
-				) {
-					return
-				}
+						})
 
-				const completed = createDeferred<void>()
-				unsubscribe = prepared.session.addListener((notification) => {
-					const method = notification.method
-					const params = notification.params
+						const completed = createDeferred<void>()
+						unsubscribe = prepared.session.addListener((notification) => {
+							const method = notification.method
+							const params = notification.params
 
-					if (method === 'item/agentMessage/delta') {
-						const delta = getString(params?.delta) ?? ''
-						if (!delta) {
-							return
-						}
+							if (method === 'item/agentMessage/delta') {
+								const delta = getString(params?.delta) ?? ''
+								if (!delta) {
+									return
+								}
 
-						if (structuredToolLoop) {
-							streamedText += delta
-							finalText = streamedText
-							return
-						}
+								if (structuredToolLoop) {
+									streamedText += delta
+									finalText = streamedText
+									return
+								}
 
-						if (!textStarted) {
-							textStarted = true
-							if (
-								!safeEnqueue(
-								formatSse('content_block_start', {
-									type: 'content_block_start',
-									index: 0,
-									content_block: {
-										type: 'text',
-										text: '',
-									},
-								}),
+								if (!textStarted) {
+									textStarted = true
+									if (
+										!safeEnqueue(
+											formatSse('content_block_start', {
+												type: 'content_block_start',
+												index: 0,
+												content_block: {
+													type: 'text',
+													text: '',
+												},
+											}),
+										)
+									) {
+										return
+									}
+								}
+
+								streamedText += delta
+								finalText = streamedText
+								safeEnqueue(
+									formatSse('content_block_delta', {
+										type: 'content_block_delta',
+										index: 0,
+										delta: {
+											type: 'text_delta',
+											text: delta,
+										},
+									}),
 								)
-							) {
 								return
 							}
-						}
 
-						streamedText += delta
-						finalText = streamedText
-						safeEnqueue(
-							formatSse('content_block_delta', {
-								type: 'content_block_delta',
-								index: 0,
-								delta: {
-									type: 'text_delta',
-									text: delta,
-								},
-							}),
-						)
-						return
-					}
+							if (method === 'item/completed') {
+								const item = getObject(params?.item)
+								if (item?.type === 'agentMessage') {
+									finalText = getItemText(item) ?? finalText
+								}
+								return
+							}
 
-					if (method === 'item/completed') {
-						const item = getObject(params?.item)
-						if (item?.type === 'agentMessage') {
-							finalText = getItemText(item) ?? finalText
-						}
-						return
-					}
+							if (method === 'thread/tokenUsage/updated') {
+								usage = getTurnUsage(params) ?? usage
+								return
+							}
 
-					if (method === 'thread/tokenUsage/updated') {
-						usage = getTurnUsage(params) ?? usage
-						return
-					}
-
-					if (method === 'turn/completed') {
-						if (structuredToolLoop) {
-							const decision = parseCodexBridgeDecision(finalText, request)
-							if (decision?.kind === 'tool_use') {
+							if (method === 'turn/completed') {
 								const activePrepared = prepared
 								if (!activePrepared) {
 									unsubscribe?.()
 									completed.resolve()
 									return
 								}
-								let blockIndex = 0
-								if (decision.preamble?.trim()) {
-									safeEnqueue(
-										formatSse('content_block_start', {
-											type: 'content_block_start',
-											index: blockIndex,
-											content_block: {
-												type: 'text',
-												text: '',
+								const decision = structuredToolLoop
+									? parseCodexBridgeDecision(finalText, request)
+									: null
+								updateThreadCacheProgress(
+									activePrepared.cacheKey,
+									activePrepared.cacheRecord,
+									request.messages,
+								)
+
+								if (structuredToolLoop) {
+									if (decision?.kind === 'tool_use') {
+										let blockIndex = 0
+										if (decision.preamble?.trim()) {
+											safeEnqueue(
+												formatSse('content_block_start', {
+													type: 'content_block_start',
+													index: blockIndex,
+													content_block: {
+														type: 'text',
+														text: '',
+													},
+												}),
+											)
+											safeEnqueue(
+												formatSse('content_block_delta', {
+													type: 'content_block_delta',
+													index: blockIndex,
+													delta: {
+														type: 'text_delta',
+														text: decision.preamble,
+													},
+												}),
+											)
+											safeEnqueue(
+												formatSse('content_block_stop', {
+													type: 'content_block_stop',
+													index: blockIndex,
+												}),
+											)
+											blockIndex += 1
+										}
+
+										const toolUseId = `toolu_${crypto.randomUUID()}`
+										safeEnqueue(
+											formatSse('content_block_start', {
+												type: 'content_block_start',
+												index: blockIndex,
+												content_block: {
+													type: 'tool_use',
+													id: toolUseId,
+													name: decision.name,
+													input: {},
+												},
+											}),
+										)
+										safeEnqueue(
+											formatSse('content_block_delta', {
+												type: 'content_block_delta',
+												index: blockIndex,
+												delta: {
+													type: 'input_json_delta',
+													partial_json: JSON.stringify(decision.input),
+												},
+											}),
+										)
+										safeEnqueue(
+											formatSse('content_block_stop', {
+												type: 'content_block_stop',
+												index: blockIndex,
+											}),
+										)
+										safeEnqueue(
+											formatSse('message_delta', {
+												type: 'message_delta',
+												delta: {
+													stop_reason: 'tool_use',
+													stop_sequence: null,
+												},
+												usage: {
+													output_tokens: usage.outputTokens,
+												},
+											}),
+										)
+										safeEnqueue(
+											formatSse('message_stop', {
+												type: 'message_stop',
+											}),
+										)
+										void logger?.onComplete?.({
+											stopReason: 'tool_use',
+											usage,
+											promptMetrics: activePrepared.promptMetrics,
+											finalText,
+											decision,
+											metadata: {
+												...activePrepared.metadata,
+												model: activePrepared.model,
 											},
-										}),
-									)
+										})
+										unsubscribe?.()
+										completed.resolve()
+										return
+									}
+
+									if (decision?.kind === 'assistant') {
+										finalText = decision.text
+									}
+								}
+
+								if (!textStarted && finalText) {
+									textStarted = true
+									if (
+										!safeEnqueue(
+											formatSse('content_block_start', {
+												type: 'content_block_start',
+												index: 0,
+												content_block: {
+													type: 'text',
+													text: '',
+												},
+											}),
+										)
+									) {
+										unsubscribe?.()
+										completed.resolve()
+										return
+									}
 									safeEnqueue(
 										formatSse('content_block_delta', {
 											type: 'content_block_delta',
-											index: blockIndex,
+											index: 0,
 											delta: {
 												type: 'text_delta',
-												text: decision.preamble,
+												text: finalText,
 											},
 										}),
 									)
+								}
+
+								if (textStarted) {
 									safeEnqueue(
 										formatSse('content_block_stop', {
 											type: 'content_block_stop',
-											index: blockIndex,
+											index: 0,
 										}),
 									)
-									blockIndex += 1
 								}
 
-								const toolUseId = `toolu_${crypto.randomUUID()}`
-								safeEnqueue(
-									formatSse('content_block_start', {
-										type: 'content_block_start',
-										index: blockIndex,
-										content_block: {
-											type: 'tool_use',
-											id: toolUseId,
-											name: decision.name,
-											input: {},
-										},
-									}),
-								)
-								safeEnqueue(
-									formatSse('content_block_delta', {
-										type: 'content_block_delta',
-										index: blockIndex,
-										delta: {
-											type: 'input_json_delta',
-											partial_json: JSON.stringify(decision.input),
-										},
-									}),
-								)
-								safeEnqueue(
-									formatSse('content_block_stop', {
-										type: 'content_block_stop',
-										index: blockIndex,
-									}),
-								)
 								safeEnqueue(
 									formatSse('message_delta', {
 										type: 'message_delta',
 										delta: {
-											stop_reason: 'tool_use',
+											stop_reason: 'end_turn',
 											stop_sequence: null,
 										},
 										usage: {
@@ -813,135 +1552,90 @@ export function createCodexAnthropicStream(
 									}),
 								)
 								void logger?.onComplete?.({
-									stopReason: 'tool_use',
+									stopReason: 'end_turn',
 									usage,
+									promptMetrics: activePrepared.promptMetrics,
 									finalText,
 									decision,
 									metadata: {
-										threadId: activePrepared.threadId,
-										workspaceRoot: activePrepared.workspaceRoot,
+										...activePrepared.metadata,
 										model: activePrepared.model,
 									},
 								})
 								unsubscribe?.()
 								completed.resolve()
-								return
 							}
+						})
 
-							if (decision?.kind === 'assistant') {
-								finalText = decision.text
+						try {
+							await prepared.session.request(
+								'turn/start',
+								buildTurnStartParams(
+									prepared.threadId,
+									prepared.reasoningEffort,
+									config,
+									prepared.promptText,
+								),
+								config.codexInitTimeoutMs,
+							)
+						} catch (error) {
+							unsubscribe?.()
+							unsubscribe = null
+							if (!forceFreshThread && shouldRetryWithFreshThread(prepared)) {
+								throw createRetryError(prepared, error)
 							}
+							throw error
 						}
 
-						const activePrepared = prepared
-						if (!activePrepared) {
-							unsubscribe?.()
-							completed.resolve()
+						if (
+							!safeEnqueue(
+								formatSse('message_start', {
+									type: 'message_start',
+									message: {
+										id: `msg_${crypto.randomUUID()}`,
+										type: 'message',
+										role: 'assistant',
+										model: prepared.model,
+										content: [],
+										stop_reason: null,
+										stop_sequence: null,
+										usage: {
+											input_tokens: 0,
+											output_tokens: 0,
+										},
+									},
+								}),
+							)
+						) {
 							return
 						}
 
-						if (!textStarted && finalText) {
-							textStarted = true
-							if (
-								!safeEnqueue(
-								formatSse('content_block_start', {
-									type: 'content_block_start',
-									index: 0,
-									content_block: {
-										type: 'text',
-										text: '',
-									},
-								}),
-								)
-							) {
-								unsubscribe?.()
-								completed.resolve()
-								return
-							}
-							safeEnqueue(
-								formatSse('content_block_delta', {
-									type: 'content_block_delta',
-									index: 0,
-									delta: {
-										type: 'text_delta',
-									text: finalText,
-								},
-							}),
-							)
+						await Promise.race([
+							completed.promise,
+							new Promise<void>((_, reject) =>
+								setTimeout(
+									() => reject(new Error('Codex stream 완료를 기다리다 시간 초과되었습니다.')),
+									config.codexTurnTimeoutMs,
+								),
+							),
+						])
+						safeClose()
+						return
+					} catch (error) {
+						if (!forceFreshThread && error instanceof FreshThreadRetryRequiredError) {
+							await prepared?.cleanup()
+							prepared = null
+							continue
 						}
-
-						if (textStarted) {
-							safeEnqueue(
-								formatSse('content_block_stop', {
-									type: 'content_block_stop',
-									index: 0,
-								}),
-							)
-						}
-
-						safeEnqueue(
-							formatSse('message_delta', {
-								type: 'message_delta',
-								delta: {
-									stop_reason: 'end_turn',
-									stop_sequence: null,
-								},
-								usage: {
-									output_tokens: usage.outputTokens,
-								},
-							}),
-						)
-						safeEnqueue(
-							formatSse('message_stop', {
-								type: 'message_stop',
-							}),
-						)
-						void logger?.onComplete?.({
-							stopReason: 'end_turn',
-							usage,
-							finalText,
-							decision: structuredToolLoop
-								? parseCodexBridgeDecision(finalText, request)
-								: null,
-							metadata: {
-								threadId: activePrepared.threadId,
-								workspaceRoot: activePrepared.workspaceRoot,
-								model: activePrepared.model,
-							},
-						})
-						unsubscribe?.()
-						completed.resolve()
+						throw error
 					}
-				})
-
-				await prepared.session.request(
-					'turn/start',
-					buildTurnStartParams(
-						prepared.threadId,
-						prepared.reasoningEffort,
-						config,
-						request,
-					),
-					config.codexInitTimeoutMs,
-				)
-
-				await Promise.race([
-					completed.promise,
-					new Promise<void>((_, reject) =>
-						setTimeout(
-							() => reject(new Error('Codex stream 완료를 기다리다 시간 초과되었습니다.')),
-							config.codexTurnTimeoutMs,
-						),
-					),
-				])
-				safeClose()
+				}
 			} catch (error) {
 				void logger?.onError?.({
 					error,
 					metadata: prepared
 						? {
-								threadId: prepared.threadId,
-								workspaceRoot: prepared.workspaceRoot,
+								...prepared.metadata,
 								model: prepared.model,
 							}
 						: undefined,
@@ -960,7 +1654,6 @@ export function createCodexAnthropicStream(
 					clearInterval(keepAliveTimer)
 				}
 				unsubscribe?.()
-				prepared?.session.close()
 				await prepared?.cleanup()
 			}
 		},
@@ -972,14 +1665,12 @@ export function createCodexAnthropicStream(
 			void logger?.onCancel?.({
 				metadata: prepared
 					? {
-							threadId: prepared.threadId,
-							workspaceRoot: prepared.workspaceRoot,
+							...prepared.metadata,
 							model: prepared.model,
 						}
 					: undefined,
 			})
 			unsubscribe?.()
-			prepared?.session.close()
 			void prepared?.cleanup()
 		},
 	})

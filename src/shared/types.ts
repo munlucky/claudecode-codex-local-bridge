@@ -124,6 +124,26 @@ export type CodexBridgeDecision =
 	| CodexBridgeAssistantDecision
 	| CodexBridgeToolUseDecision
 
+export type CodexThreadMode = 'new' | 'reused' | 'recreated'
+
+export type CodexThreadReuseReason =
+	| 'no_session'
+	| 'cache_miss'
+	| 'fingerprint_mismatch'
+	| 'retry_after_error'
+	| 'cache_hit'
+	| 'cache_expired'
+
+export interface CodexTurnMetadata {
+	threadId: string
+	workspaceRoot: string
+	sessionId: string | null
+	threadMode: CodexThreadMode
+	threadReuseReason: CodexThreadReuseReason
+	threadCacheKey: string | null
+	threadFingerprint: string
+}
+
 export interface CodexTokenUsage {
 	inputTokens: number
 	cachedInputTokens: number
@@ -132,12 +152,31 @@ export interface CodexTokenUsage {
 	totalTokens: number
 }
 
+export interface CodexPromptMetrics {
+	userMessageCount: number
+	totalMessageCount: number
+	newMessageCount: number
+	systemCharCount: number
+	toolCount: number
+	toolNames: string[]
+	toolSchemaCharCount: number
+	developerInstructionCharCount: number
+	promptCharCount: number
+	userVisibleCharCount: number
+	estimatedPromptTokens: number
+	estimatedUserVisibleTokens: number
+	promptMode: 'full' | 'delta'
+	replayFromMessageIndex: number
+}
+
 export interface CodexTurnResult {
 	id: string
 	model: string
 	text: string
 	usage: CodexTokenUsage
+	promptMetrics?: CodexPromptMetrics
 	decision?: CodexBridgeDecision | null
+	metadata?: CodexTurnMetadata & { model: string }
 }
 
 export interface RouterHealthResponse {
