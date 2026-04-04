@@ -763,6 +763,14 @@ export function mapCodexResultToAnthropic(
 	response: CodexTurnResult,
 	requestedModel: string,
 ): AnthropicMessagesResponse {
+	const usage = {
+		input_tokens: response.usage.inputTokens,
+		output_tokens: response.usage.outputTokens,
+		cache_read_input_tokens: response.usage.cachedInputTokens,
+		reasoning_output_tokens: response.usage.reasoningOutputTokens,
+		total_tokens: response.usage.totalTokens,
+	}
+
 	if (response.decision?.kind === 'tool_use') {
 		const content: AnthropicResponseContentBlock[] = []
 		if (response.decision.preamble?.trim()) {
@@ -787,10 +795,7 @@ export function mapCodexResultToAnthropic(
 			content,
 			stop_reason: 'tool_use',
 			stop_sequence: null,
-			usage: {
-				input_tokens: response.usage.inputTokens,
-				output_tokens: response.usage.outputTokens,
-			},
+			usage,
 		}
 	}
 
@@ -808,10 +813,7 @@ export function mapCodexResultToAnthropic(
 			],
 			stop_reason: 'end_turn',
 			stop_sequence: null,
-			usage: {
-				input_tokens: response.usage.inputTokens,
-				output_tokens: response.usage.outputTokens,
-			},
+			usage,
 		}
 	}
 
@@ -828,9 +830,6 @@ export function mapCodexResultToAnthropic(
 		],
 		stop_reason: 'end_turn',
 		stop_sequence: null,
-		usage: {
-			input_tokens: response.usage.inputTokens,
-			output_tokens: response.usage.outputTokens,
-		},
+		usage,
 	}
 }

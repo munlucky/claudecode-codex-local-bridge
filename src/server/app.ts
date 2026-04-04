@@ -72,7 +72,7 @@ export const requestSchema = z.object({
 	max_tokens: z.number().int().positive(),
 	messages: z.array(
 		z.object({
-			role: z.enum(['user', 'assistant']),
+			role: z.enum(['user', 'assistant', 'system']),
 			content: z.union([z.string(), z.array(contentBlockSchema)]),
 		}),
 	),
@@ -334,9 +334,10 @@ export function createApp() {
 					},
 					onError: async ({ error, metadata }) => {
 						const message = error instanceof Error ? error.message : String(error)
+						const status = error instanceof AuthConfigurationError ? 401 : 200
 						await captureRouterStreamEvent(config, traceContext, {
 							stream_phase: 'failed',
-							status: 200,
+							status,
 							duration_ms: Date.now() - startedAt,
 							stream_end_reason: 'error',
 							error_message: message,
@@ -348,7 +349,7 @@ export function createApp() {
 							thread_cache_key: metadata?.threadCacheKey ?? null,
 						})
 						logRouterLine(
-							`stream failed request_id=${traceContext.router_request_id} conversation_id=${metadata?.threadId ?? 'none'} error=${JSON.stringify(message)} thread_mode=${metadata?.threadMode ?? 'none'} thread_reuse_reason=${metadata?.threadReuseReason ?? 'none'}`,
+							`stream failed request_id=${traceContext.router_request_id} status=${status} conversation_id=${metadata?.threadId ?? 'none'} error=${JSON.stringify(message)} thread_mode=${metadata?.threadMode ?? 'none'} thread_reuse_reason=${metadata?.threadReuseReason ?? 'none'}`,
 						)
 					},
 					onCancel: async ({ metadata }) => {
@@ -413,16 +414,17 @@ export function createApp() {
 			return c.json(anthropicResponse)
 		} catch (error) {
 			if (error instanceof AuthConfigurationError) {
+				const status = 401
 				await captureRouterResponse(config, traceContext, {
-					status: 500,
+					status,
 					duration_ms: Date.now() - startedAt,
-					error_type: mapErrorType(500),
+					error_type: mapErrorType(status),
 					error_message: error.message,
 				})
 				logRouterLine(
-					`messages failed request_id=${traceContext.router_request_id} status=500 duration_ms=${Date.now() - startedAt} error=${JSON.stringify(error.message)}`,
+					`messages failed request_id=${traceContext.router_request_id} status=${status} duration_ms=${Date.now() - startedAt} error=${JSON.stringify(error.message)}`,
 				)
-				return buildErrorResponse(error.message, 500, traceContext.router_request_id)
+				return buildErrorResponse(error.message, status, traceContext.router_request_id)
 			}
 
 			const message = error instanceof Error ? error.message : '내부 서버 오류'

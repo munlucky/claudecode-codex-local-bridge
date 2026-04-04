@@ -46,7 +46,7 @@ export type AnthropicInputContentBlock =
 	| AnthropicImageBlock
 
 export interface AnthropicMessage {
-	role: 'user' | 'assistant'
+	role: 'user' | 'assistant' | 'system'
 	content: string | AnthropicInputContentBlock[]
 }
 
@@ -90,6 +90,9 @@ export interface AnthropicMessagesRequest {
 export interface AnthropicUsage {
 	input_tokens: number
 	output_tokens: number
+	cache_read_input_tokens?: number
+	reasoning_output_tokens?: number
+	total_tokens?: number
 }
 
 export type AnthropicResponseContentBlock =
