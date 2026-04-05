@@ -38,10 +38,33 @@ type PendingRequest = {
 	timeout: Timer
 }
 
+type RetryClassification = 'retryable' | 'non_retryable'
+
+type TimeoutStage =
+	| 'session_initialize'
+	| 'thread_start'
+	| 'turn_start'
+	| 'first_token'
+	| 'turn_complete'
+
+type SessionCloseReason =
+	| 'closed'
+	| 'process_exit'
+	| 'stderr'
+	| 'request_failed'
+	| 'client_abort'
+	| 'cache_evicted'
+
+type CacheTtlPolicy = {
+	idleTtlMs: number
+	maxLifetimeMs: number
+}
+
 export interface CodexRequestContext {
 	sessionId?: string | null
 	routerRequestId?: string | null
 	userAgent?: string | null
+	abortSignal?: AbortSignal | null
 }
 
 export interface StreamLifecycleLogger {
@@ -73,8 +96,14 @@ const ZERO_USAGE: CodexTokenUsage = {
 
 const THREAD_CACHE_LIMIT = 128
 const SESSION_CACHE_IDLE_TTL_MS = 60 * 60 * 1000
+const SESSION_CACHE_MAX_LIFETIME_MS = 6 * 60 * 60 * 1000
 const ANONYMOUS_THREAD_TTL_MS = 30 * 60 * 1000
+const ANONYMOUS_THREAD_MAX_LIFETIME_MS = 90 * 60 * 1000
 const EPHEMERAL_SESSION_TTL_MS = 30 * 60 * 1000
+const TURN_FIRST_TOKEN_TIMEOUT_MS = 30 * 1000
+const MAX_RETRY_ATTEMPTS = 3
+const RETRY_BACKOFF_BASE_MS = 250
+const RETRY_BACKOFF_MAX_MS = 2000
 
 type ThreadCacheRecord = {
 	session: CodexAppServerSession
@@ -84,11 +113,15 @@ type ThreadCacheRecord = {
 	fingerprint: string
 	lastMessageCount: number
 	transcriptHash: string
+	createdAt: number
+	lastUsedAt: number
 	updatedAt: number
+	failureCount: number
 	busy: boolean
 	waiters: Array<() => void>
 	idleTimer: Timer | null
-	ttlMs: number
+	ttlPolicy: CacheTtlPolicy
+	closed: boolean
 }
 
 type EphemeralSessionRecord = {
@@ -115,6 +148,25 @@ type PreparedSession = {
 const threadCache = new Map<string, ThreadCacheRecord>()
 const pendingThreadCacheCreates = new Map<string, Promise<ThreadCacheRecord>>()
 const ephemeralSessionCache = new Map<string, EphemeralSessionRecord>()
+const runtimeCounters = {
+	retryableFailures: 0,
+	nonRetryableFailures: 0,
+	retries: 0,
+}
+
+export function getCodexBridgeRuntimeSnapshot() {
+	return {
+		activeSessionCount: threadCache.size,
+		pendingSessionCreates: pendingThreadCacheCreates.size,
+		queueDepth: Array.from(threadCache.values()).reduce(
+			(total, record) => total + record.waiters.length + (record.busy ? 1 : 0),
+			0,
+		),
+		recentRetryableFailures: runtimeCounters.retryableFailures,
+		recentNonRetryableFailures: runtimeCounters.nonRetryableFailures,
+		recentRetries: runtimeCounters.retries,
+	}
+}
 
 function hashMessages(messages: AnthropicMessagesRequest['messages']): string {
 	return createHash('sha1').update(JSON.stringify(messages)).digest('hex')
@@ -131,6 +183,7 @@ function updateThreadCacheProgress(
 
 	record.lastMessageCount = messages.length
 	record.transcriptHash = hashMessages(messages)
+	record.lastUsedAt = Date.now()
 	record.updatedAt = Date.now()
 	upsertThreadCache(cacheKey, record)
 }
@@ -140,6 +193,7 @@ function normalizeRequestContext(context?: CodexRequestContext): Required<CodexR
 		sessionId: context?.sessionId?.trim() || null,
 		routerRequestId: context?.routerRequestId?.trim() || null,
 		userAgent: context?.userAgent?.trim() || null,
+		abortSignal: context?.abortSignal ?? null,
 	}
 }
 
@@ -176,6 +230,107 @@ export function buildThreadFingerprint(
 		.update('\n')
 		.update(threadInvariantInput)
 		.digest('hex')
+}
+
+export function isCacheLifetimeExceeded(
+	createdAt: number,
+	lastUsedAt: number,
+	policy: CacheTtlPolicy,
+	now = Date.now(),
+): boolean {
+	return now - lastUsedAt > policy.idleTtlMs || now - createdAt > policy.maxLifetimeMs
+}
+
+export class CodexAbortError extends Error {
+	constructor(message = '요청이 취소되었습니다.') {
+		super(message)
+		this.name = 'CodexAbortError'
+	}
+}
+
+export class CodexTimeoutError extends Error {
+	readonly stage: TimeoutStage
+
+	constructor(stage: TimeoutStage, timeoutMs: number, operation: string) {
+		super(`${operation} 작업이 ${timeoutMs}ms 내에 완료되지 않았습니다.`)
+		this.name = 'CodexTimeoutError'
+		this.stage = stage
+	}
+}
+
+export class CodexProcessStartError extends Error {
+	readonly classification: RetryClassification
+
+	constructor(message: string, classification: RetryClassification = 'retryable') {
+		super(message)
+		this.name = 'CodexProcessStartError'
+		this.classification = classification
+	}
+}
+
+export function classifyCodexError(error: unknown): RetryClassification {
+	if (error instanceof AuthConfigurationError || error instanceof CodexAbortError) {
+		return 'non_retryable'
+	}
+
+	if (error instanceof FreshThreadRetryRequiredError || error instanceof CodexTimeoutError) {
+		return 'retryable'
+	}
+
+	if (error instanceof CodexProcessStartError) {
+		return error.classification
+	}
+
+	const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase()
+	if (
+		message.includes('시간 초과') ||
+		message.includes('timeout') ||
+		message.includes('econnreset') ||
+		message.includes('broken pipe') ||
+		message.includes('프로세스가 종료') ||
+		message.includes('stderr')
+	) {
+		return 'retryable'
+	}
+
+	return 'non_retryable'
+}
+
+function computeRetryDelay(attempt: number): number {
+	const capped = Math.min(RETRY_BACKOFF_MAX_MS, RETRY_BACKOFF_BASE_MS * 2 ** attempt)
+	return capped + Math.floor(Math.random() * 100)
+}
+
+async function sleep(ms: number): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function abortErrorFromSignal(signal: AbortSignal): CodexAbortError {
+	return new CodexAbortError(signal.reason instanceof Error ? signal.reason.message : '요청이 취소되었습니다.')
+}
+
+function throwIfAborted(signal: AbortSignal | null | undefined) {
+	if (signal?.aborted) {
+		throw abortErrorFromSignal(signal)
+	}
+}
+
+function createAbortPromise(signal: AbortSignal | null | undefined): Promise<never> {
+	if (!signal) {
+		return new Promise<never>(() => {})
+	}
+
+	if (signal.aborted) {
+		return Promise.reject(abortErrorFromSignal(signal))
+	}
+
+	return new Promise<never>((_, reject) => {
+		const handleAbort = () => {
+			signal.removeEventListener('abort', handleAbort)
+			reject(abortErrorFromSignal(signal))
+		}
+		signal.addEventListener('abort', handleAbort, { once: true })
+	})
 }
 
 function upsertThreadCache(cacheKey: string, record: ThreadCacheRecord) {
@@ -257,6 +412,10 @@ function getOrCreateEphemeralSessionId(
 }
 
 async function closeThreadCacheRecord(cacheKey: string, record: ThreadCacheRecord) {
+	if (record.closed) {
+		return
+	}
+	record.closed = true
 	clearIdleTimer(record)
 	if (threadCache.get(cacheKey) === record) {
 		threadCache.delete(cacheKey)
@@ -268,14 +427,14 @@ async function closeThreadCacheRecord(cacheKey: string, record: ThreadCacheRecor
 	while (record.waiters.length > 0) {
 		record.waiters.shift()?.()
 	}
-	record.session.close()
+	record.session.close('cache_evicted')
 }
 
 function scheduleIdleEviction(cacheKey: string, record: ThreadCacheRecord) {
 	clearIdleTimer(record)
 	record.idleTimer = setTimeout(() => {
 		void closeThreadCacheRecord(cacheKey, record)
-	}, record.ttlMs)
+	}, record.ttlPolicy.idleTtlMs)
 }
 
 async function waitForThreadCacheRecord(record: ThreadCacheRecord) {
@@ -289,7 +448,11 @@ async function waitForThreadCacheRecord(record: ThreadCacheRecord) {
 }
 
 async function releaseThreadCacheRecord(cacheKey: string, record: ThreadCacheRecord) {
+	if (record.closed) {
+		return
+	}
 	record.updatedAt = Date.now()
+	record.lastUsedAt = record.updatedAt
 	record.busy = false
 	const waiter = record.waiters.shift()
 	if (waiter) {
@@ -327,7 +490,7 @@ function logBridgeThreadEvent(
 		}
 	}
 
-	console.log(`[router] ${new Date().toISOString()} ${event} ${pairs.join(' ')}`)
+	process.stdout.write(`[router] ${new Date().toISOString()} ${event} ${pairs.join(' ')}\n`)
 }
 
 function createDeferred<T>() {
@@ -513,9 +676,12 @@ class CodexAppServerSession {
 	private readonly decoder = new TextDecoder()
 	private readonly pending = new Map<number, PendingRequest>()
 	private readonly listeners = new Set<(notification: JsonRpcNotification) => void>()
+	private readonly closeListeners = new Set<(reason: SessionCloseReason, detail?: string) => void>()
 	private nextId = 1
 	private buffer = ''
 	private closed = false
+	private closeDetail: string | null = null
+	private lastExitCode: number | null = null
 
 	private constructor(config: RouterConfig) {
 		const executable = Bun.which(config.codexCommand) ?? config.codexCommand
@@ -532,8 +698,15 @@ class CodexAppServerSession {
 		})
 		this.processStdout()
 		this.processStderr()
-		void this.process.exited.then(() => {
-			this.failAll(new Error('codex app-server 프로세스가 종료되었습니다.'))
+		void this.process.exited.then((code) => {
+			this.lastExitCode = typeof code === 'number' ? code : null
+			this.failAll(
+				new CodexProcessStartError(
+					`codex app-server 프로세스가 종료되었습니다.${this.lastExitCode !== null ? ` (exit=${this.lastExitCode})` : ''}`,
+				),
+				'process_exit',
+				this.lastExitCode !== null ? `exit=${this.lastExitCode}` : undefined,
+			)
 		})
 	}
 
@@ -549,11 +722,12 @@ class CodexAppServerSession {
 					},
 				},
 				config.codexInitTimeoutMs,
+				'session_initialize',
 			)
 			session.notify('initialized', {})
 			return session
 		} catch (error) {
-			session.close()
+			session.close('request_failed')
 			throw error
 		}
 	}
@@ -594,7 +768,7 @@ class CodexAppServerSession {
 		void (async () => {
 			const text = (await new Response(getReadableStream(this.process.stderr, 'stderr')).text()).trim()
 			if (text && !this.closed) {
-				this.failAll(new Error(text))
+				this.failAll(new CodexProcessStartError(text), 'stderr', text)
 			}
 		})()
 	}
@@ -644,13 +818,25 @@ class CodexAppServerSession {
 		)
 	}
 
-	private failAll(error: Error) {
+	private failAll(
+		error: Error,
+		reason: SessionCloseReason = 'closed',
+		detail?: string,
+	) {
+		if (this.closed) {
+			return
+		}
 		this.closed = true
+		this.closeDetail = detail ?? null
 		for (const pending of this.pending.values()) {
 			clearTimeout(pending.timeout)
 			pending.reject(error)
 		}
 		this.pending.clear()
+		for (const listener of this.closeListeners) {
+			listener(reason, this.closeDetail ?? undefined)
+		}
+		this.closeListeners.clear()
 	}
 
 	addListener(listener: (notification: JsonRpcNotification) => void): () => void {
@@ -664,6 +850,7 @@ class CodexAppServerSession {
 		method: string,
 		params: Record<string, unknown>,
 		timeoutMs: number,
+		stage: TimeoutStage = 'turn_complete',
 	): Promise<JsonRpcResult> {
 		if (this.closed) {
 			return Promise.reject(new Error('codex app-server 세션이 닫혔습니다.'))
@@ -673,7 +860,7 @@ class CodexAppServerSession {
 		const deferred = createDeferred<JsonRpcResult>()
 		const timeout = setTimeout(() => {
 			this.pending.delete(id)
-			deferred.reject(new Error(`${method} 요청이 시간 초과되었습니다.`))
+			deferred.reject(new CodexTimeoutError(stage, timeoutMs, method))
 		}, timeoutMs)
 
 		this.pending.set(id, {
@@ -687,23 +874,34 @@ class CodexAppServerSession {
 		return deferred.promise
 	}
 
-	close() {
+	close(reason: SessionCloseReason = 'closed') {
 		if (this.closed) {
 			return
 		}
 
-		this.failAll(new Error('codex app-server 세션이 종료되었습니다.'))
+		this.failAll(new Error('codex app-server 세션이 종료되었습니다.'), reason)
 		this.process.kill()
 	}
 
 	isClosed() {
 		return this.closed
 	}
+
+	getLastExitCode() {
+		return this.lastExitCode
+	}
+
+	addCloseListener(listener: (reason: SessionCloseReason, detail?: string) => void): () => void {
+		this.closeListeners.add(listener)
+		return () => {
+			this.closeListeners.delete(listener)
+		}
+	}
 }
 
 function isLegacyAuthMethodAllowed(value: unknown): value is (typeof ALLOWED_AUTH_METHODS)[number] {
 	const authMethod = getString(value)
-	return authMethod !== null && ALLOWED_AUTH_METHODS.includes(authMethod)
+	return authMethod !== null && ALLOWED_AUTH_METHODS.includes(authMethod as (typeof ALLOWED_AUTH_METHODS)[number])
 }
 
 function hasAccountIdentity(value: unknown): boolean {
@@ -721,12 +919,12 @@ function hasAccountIdentity(value: unknown): boolean {
 		return Object.keys(object).length > 0
 	}
 
-	return getString(account.account_id) || getString(account.id) || getString(account.email)
+	return Boolean(getString(account.account_id) || getString(account.id) || getString(account.email))
 }
 
 async function hasAccountSession(session: CodexAppServerSession, timeoutMs: number): Promise<boolean> {
 	try {
-		const accountRead = await session.request('account/read', {}, timeoutMs)
+		const accountRead = await session.request('account/read', {}, timeoutMs, 'session_initialize')
 		return hasAccountIdentity(accountRead.account) || hasAccountIdentity(accountRead)
 	} catch {
 		return false
@@ -742,6 +940,7 @@ async function hasLegacySession(session: CodexAppServerSession, timeoutMs: numbe
 				refreshToken: true,
 			},
 			timeoutMs,
+			'session_initialize',
 		)
 		const authMethod = authStatus.authMethod
 		return isLegacyAuthMethodAllowed(authMethod)
@@ -839,6 +1038,7 @@ async function startThread(
 			developerInstructions: input.developerInstructions,
 		},
 		config.codexInitTimeoutMs,
+		'thread_start',
 	)
 
 	const thread = getObject(threadStart.thread)
@@ -873,7 +1073,7 @@ async function createThreadCacheRecord(
 		threadFingerprint: string
 		lastMessageCount: number
 		transcriptHash: string
-		ttlMs: number
+		ttlMs: CacheTtlPolicy
 	},
 ): Promise<ThreadCacheRecord> {
 	const session = await createCachedSession(config)
@@ -891,16 +1091,23 @@ async function createThreadCacheRecord(
 			fingerprint: input.threadFingerprint,
 			lastMessageCount: input.lastMessageCount,
 			transcriptHash: input.transcriptHash,
+			createdAt: Date.now(),
+			lastUsedAt: Date.now(),
 			updatedAt: Date.now(),
+			failureCount: 0,
 			busy: true,
 			waiters: [],
 			idleTimer: null,
-			ttlMs: input.ttlMs,
+			ttlPolicy: input.ttlMs,
+			closed: false,
 		}
+		session.addCloseListener(() => {
+			void closeThreadCacheRecord(input.cacheKey, record)
+		})
 		upsertThreadCache(input.cacheKey, record)
 		return record
 	} catch (error) {
-		session.close()
+		session.close('request_failed')
 		throw error
 	}
 }
@@ -915,14 +1122,18 @@ async function acquireOrCreateThreadCacheRecord(
 		threadFingerprint: string
 		lastMessageCount: number
 		transcriptHash: string
-		ttlMs: number
+		ttlMs: CacheTtlPolicy
 	},
 ): Promise<{ record: ThreadCacheRecord; reuseReason: CodexThreadReuseReason }> {
 	let sawExpired = false
 	while (true) {
 		const cached = threadCache.get(input.cacheKey) ?? null
 		if (cached) {
-			const expired = Date.now() - cached.updatedAt > cached.ttlMs
+			const expired = isCacheLifetimeExceeded(
+				cached.createdAt,
+				cached.lastUsedAt,
+				cached.ttlPolicy,
+			)
 			if (cached.session.isClosed() || expired) {
 				sawExpired ||= expired
 				await closeThreadCacheRecord(input.cacheKey, cached)
@@ -931,11 +1142,12 @@ async function acquireOrCreateThreadCacheRecord(
 			} else {
 				clearIdleTimer(cached)
 				cached.busy = true
+				cached.lastUsedAt = Date.now()
 				cached.updatedAt = Date.now()
 				upsertThreadCache(input.cacheKey, cached)
 				return {
 					record: cached,
-					reuseReason: expired ? 'cache_expired' : 'cache_hit',
+					reuseReason: sawExpired ? 'cache_expired' : 'cache_hit',
 				}
 			}
 			continue
@@ -950,6 +1162,7 @@ async function acquireOrCreateThreadCacheRecord(
 			}
 			clearIdleTimer(record)
 			record.busy = true
+			record.lastUsedAt = Date.now()
 			record.updatedAt = Date.now()
 			upsertThreadCache(input.cacheKey, record)
 			return {
@@ -1012,10 +1225,18 @@ async function createPreparedSession(
 			workspaceRoot,
 			conversationSeed,
 		)
-	const cacheTtlMs =
-		explicitSessionId ? SESSION_CACHE_IDLE_TTL_MS : ANONYMOUS_THREAD_TTL_MS
+	const cacheTtlMs: CacheTtlPolicy = explicitSessionId
+		? {
+				idleTtlMs: SESSION_CACHE_IDLE_TTL_MS,
+				maxLifetimeMs: SESSION_CACHE_MAX_LIFETIME_MS,
+			}
+		: {
+				idleTtlMs: ANONYMOUS_THREAD_TTL_MS,
+				maxLifetimeMs: ANONYMOUS_THREAD_MAX_LIFETIME_MS,
+			}
 	const transcriptHash = hashMessages(request.messages)
 	if (!threadCacheKey) {
+		throwIfAborted(requestContext.abortSignal)
 		const promptText = serializeAnthropicRequestToCodexPrompt(request)
 		const promptMetrics = buildCodexPromptMetrics(request, developerInstructions, promptText)
 		const session = await createCachedSession(config)
@@ -1052,11 +1273,11 @@ async function createPreparedSession(
 				cacheRecord: null,
 				cacheKey: null,
 				cleanup: onceAsync(async () => {
-					session.close()
+					session.close('closed')
 				}),
 			}
 		} catch (error) {
-			session.close()
+			session.close('request_failed')
 			throw error
 		}
 	}
@@ -1127,6 +1348,7 @@ async function createPreparedSession(
 
 	const replacedThreadId = record.threadId
 	try {
+		throwIfAborted(requestContext.abortSignal)
 		const started = await startThread(record.session, config, {
 			workspaceRoot,
 			targetModel,
@@ -1138,7 +1360,9 @@ async function createPreparedSession(
 		record.fingerprint = threadFingerprint
 		record.lastMessageCount = request.messages.length
 		record.transcriptHash = transcriptHash
+		record.lastUsedAt = Date.now()
 		record.updatedAt = Date.now()
+		record.failureCount = 0
 		upsertThreadCache(threadCacheKey, record)
 
 		const metadata: CodexTurnMetadata = {
@@ -1212,6 +1436,9 @@ function shouldRetryWithFreshThread(prepared: PreparedSession): boolean {
 
 function createRetryError(prepared: PreparedSession, error: unknown): FreshThreadRetryRequiredError {
 	const message = error instanceof Error ? error.message : String(error)
+	if (prepared.cacheRecord) {
+		prepared.cacheRecord.failureCount += 1
+	}
 	logBridgeThreadEvent('thread_reuse_failed', {
 		requestContext: prepared.requestContext,
 		metadata: prepared.metadata,
@@ -1221,6 +1448,30 @@ function createRetryError(prepared: PreparedSession, error: unknown): FreshThrea
 		},
 	})
 	return new FreshThreadRetryRequiredError(message)
+}
+
+async function abortPreparedTurn(prepared: PreparedSession | null) {
+	if (!prepared) {
+		return
+	}
+
+	try {
+		await prepared.session.request(
+			'turn/cancel',
+			{
+				threadId: prepared.threadId,
+			},
+			1000,
+			'turn_complete',
+		)
+	} catch {}
+
+	if (prepared.cacheKey && prepared.cacheRecord) {
+		await closeThreadCacheRecord(prepared.cacheKey, prepared.cacheRecord)
+		return
+	}
+
+	prepared.session.close('client_abort')
 }
 
 function buildTurnStartParams(
@@ -1274,15 +1525,19 @@ async function executePreparedTurn(
 	let finalText = ''
 	const usage = { ...ZERO_USAGE }
 	const structuredToolLoop = Boolean(request.tools?.length)
+	const abortSignal = prepared.requestContext.abortSignal
+	throwIfAborted(abortSignal)
 
 	try {
 		const completed = createDeferred<CodexTurnResult>()
+		const firstToken = createDeferred<void>()
 		const unsubscribe = prepared.session.addListener((notification) => {
 			const method = notification.method
 			const params = notification.params
 
 			if (method === 'item/agentMessage/delta') {
 				finalText += getString(params?.delta) ?? ''
+				firstToken.resolve()
 				return
 			}
 
@@ -1290,6 +1545,7 @@ async function executePreparedTurn(
 				const item = getObject(params?.item)
 				if (item?.type === 'agentMessage') {
 					finalText = getItemText(item) ?? finalText
+					firstToken.resolve()
 				}
 				return
 			}
@@ -1326,6 +1582,7 @@ async function executePreparedTurn(
 					prepared.promptText,
 				),
 				config.codexTurnRequestTimeoutMs,
+				'turn_start',
 			)
 		} catch (error) {
 			unsubscribe()
@@ -1335,16 +1592,38 @@ async function executePreparedTurn(
 			throw error
 		}
 
+		await Promise.race([
+			firstToken.promise,
+			new Promise<void>((_, reject) =>
+				setTimeout(
+					() =>
+						reject(
+							new CodexTimeoutError('first_token', TURN_FIRST_TOKEN_TIMEOUT_MS, 'turn/first-token'),
+						),
+					TURN_FIRST_TOKEN_TIMEOUT_MS,
+				),
+			),
+			completed.promise.then(() => undefined),
+			createAbortPromise(abortSignal),
+		])
+
 		return await Promise.race([
 			completed.promise,
 			new Promise<CodexTurnResult>((_, reject) =>
 				setTimeout(
-					() => reject(new Error('Codex turn 완료를 기다리다 시간 초과되었습니다.')),
+					() =>
+						reject(
+							new CodexTimeoutError('turn_complete', config.codexTurnTimeoutMs, 'turn/complete'),
+						),
 					config.codexTurnTimeoutMs,
 				),
 			),
+			createAbortPromise(abortSignal),
 		])
 	} finally {
+		if (abortSignal?.aborted) {
+			await abortPreparedTurn(prepared)
+		}
 		await prepared.cleanup()
 	}
 }
@@ -1354,19 +1633,37 @@ export async function executeCodexTurn(
 	request: AnthropicMessagesRequest,
 	context?: CodexRequestContext,
 ): Promise<CodexTurnResult> {
-	try {
-		const prepared = await createPreparedSession(config, request, context)
-		return await executePreparedTurn(config, request, prepared)
-	} catch (error) {
-		if (!(error instanceof FreshThreadRetryRequiredError)) {
-			throw error
-		}
+	let forceFreshThread = false
+	let lastError: unknown = null
 
-		const prepared = await createPreparedSession(config, request, context, {
-			forceFreshThread: true,
-		})
-		return executePreparedTurn(config, request, prepared)
+	for (let attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt += 1) {
+		try {
+			const prepared = await createPreparedSession(config, request, context, {
+				forceFreshThread,
+			})
+			return await executePreparedTurn(config, request, prepared)
+		} catch (error) {
+			lastError = error
+			const classification = classifyCodexError(error)
+			if (classification === 'retryable') {
+				runtimeCounters.retryableFailures += 1
+			} else {
+				runtimeCounters.nonRetryableFailures += 1
+			}
+			if (error instanceof FreshThreadRetryRequiredError) {
+				forceFreshThread = true
+			}
+
+			if (attempt === MAX_RETRY_ATTEMPTS - 1 || classification !== 'retryable') {
+				throw error
+			}
+
+			runtimeCounters.retries += 1
+			await sleep(computeRetryDelay(attempt))
+		}
 	}
+
+	throw lastError instanceof Error ? lastError : new Error('Codex turn 실행에 실패했습니다.')
 }
 
 export function createCodexAnthropicStream(
@@ -1387,6 +1684,7 @@ export function createCodexAnthropicStream(
 			let streamedText = ''
 			let finalText = ''
 			const structuredToolLoop = Boolean(request.tools?.length)
+			const abortSignal = context?.abortSignal ?? null
 
 			const safeEnqueue = (payload: Uint8Array): boolean => {
 				if (streamClosed) {
@@ -1698,6 +1996,7 @@ export function createCodexAnthropicStream(
 									prepared.promptText,
 								),
 								config.codexTurnRequestTimeoutMs,
+								'turn_start',
 							)
 						} catch (error) {
 							unsubscribe?.()
@@ -1735,10 +2034,18 @@ export function createCodexAnthropicStream(
 							completed.promise,
 							new Promise<void>((_, reject) =>
 								setTimeout(
-									() => reject(new Error('Codex stream 완료를 기다리다 시간 초과되었습니다.')),
+									() =>
+										reject(
+											new CodexTimeoutError(
+												'turn_complete',
+												config.codexTurnTimeoutMs,
+												'stream/complete',
+											),
+										),
 									config.codexTurnTimeoutMs,
 								),
 							),
+							createAbortPromise(abortSignal),
 						])
 						safeClose()
 						return
@@ -1775,6 +2082,9 @@ export function createCodexAnthropicStream(
 					clearInterval(keepAliveTimer)
 				}
 				unsubscribe?.()
+				if (abortSignal?.aborted || streamClosed) {
+					await abortPreparedTurn(prepared)
+				}
 				await prepared?.cleanup()
 			}
 		},
@@ -1792,6 +2102,7 @@ export function createCodexAnthropicStream(
 					: undefined,
 			})
 			unsubscribe?.()
+			void abortPreparedTurn(prepared)
 			void prepared?.cleanup()
 		},
 	})

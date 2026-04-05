@@ -2,8 +2,17 @@ import { existsSync } from 'node:fs'
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { loadConfig } from './config.js'
-import { mapCodexResultToAnthropic } from '../bridge/anthropic/index.js'
-import { AuthConfigurationError, checkCodexAuthDependency, executeCodexTurn } from '../bridge/codex/index.js'
+import {
+	AnthropicRequestValidationError,
+	mapCodexResultToAnthropic,
+	validateAnthropicRequestSemantics,
+} from '../bridge/anthropic/index.js'
+import {
+	AuthConfigurationError,
+	checkCodexAuthDependency,
+	executeCodexTurn,
+	getCodexBridgeRuntimeSnapshot,
+} from '../bridge/codex/index.js'
 import {
 	captureAnthropicRequest,
 	buildRouterTraceContext,
@@ -16,6 +25,7 @@ import type {
 	AnthropicMessagesRequest,
 	RouterHealthResponse,
 } from '../shared/index.js'
+import type { RouterConfig } from './config.js'
 
 const contentBlockSchema: z.ZodType<unknown> = z.lazy(() =>
 	z.union([
@@ -96,6 +106,10 @@ export const requestSchema = z.object({
 
 function mapErrorType(statusCode: number): string {
 	if (statusCode === 400) {
+		return 'invalid_request_error'
+	}
+
+	if (statusCode === 422) {
 		return 'invalid_request_error'
 	}
 
@@ -199,6 +213,7 @@ export function createApp() {
 	app.get('/health', async (c) => {
 		const hasLocalAuthFile = existsSync(config.codexAuthFile)
 		const hasAuthModeDependency = await getAuthModeDependencyState(config)
+		const runtimeSnapshot = getCodexBridgeRuntimeSnapshot()
 		const body: RouterHealthResponse = {
 			status: 'ok',
 			backend: 'codex_app_server',
@@ -208,6 +223,14 @@ export function createApp() {
 			codex_auth_file: config.codexAuthFile,
 			has_local_auth_file: hasLocalAuthFile,
 			has_auth_mode_dependency: hasAuthModeDependency,
+			live: true,
+			readiness: hasAuthModeDependency ? 'ready' : 'degraded',
+			queue_depth: runtimeSnapshot.queueDepth,
+			active_session_count: runtimeSnapshot.activeSessionCount,
+			pending_session_creates: runtimeSnapshot.pendingSessionCreates,
+			recent_retryable_failures: runtimeSnapshot.recentRetryableFailures,
+			recent_non_retryable_failures: runtimeSnapshot.recentNonRetryableFailures,
+			recent_retries: runtimeSnapshot.recentRetries,
 		}
 
 		const isHealthy = Boolean(hasAuthModeDependency)
@@ -252,6 +275,7 @@ export function createApp() {
 		)
 		try {
 			requestBody = requestSchema.parse(JSON.parse(rawBody)) as AnthropicMessagesRequest
+			validateAnthropicRequestSemantics(requestBody)
 			traceContext = buildRouterTraceContext({
 				method: c.req.method,
 				path: c.req.path,
@@ -270,22 +294,28 @@ export function createApp() {
 				rawBody,
 				parseError: error instanceof Error ? error.message : 'request parse failed',
 			})
+			const status =
+				error instanceof AnthropicRequestValidationError
+					? error.statusCode
+					: 400
 			const message =
 				error instanceof z.ZodError
 					? error.issues.map((issue) => issue.message).join(', ')
+					: error instanceof AnthropicRequestValidationError
+						? error.message
 					: error instanceof Error
 						? error.message
 						: '잘못된 요청입니다.'
 			await captureRouterResponse(config, traceContext, {
-				status: 400,
+				status,
 				duration_ms: Date.now() - startedAt,
-				error_type: mapErrorType(400),
+				error_type: mapErrorType(status),
 				error_message: message,
 			})
 			logRouterLine(
-				`messages failed request_id=${traceContext.router_request_id} status=400 duration_ms=${Date.now() - startedAt} error=${JSON.stringify(message)}`,
+				`messages failed request_id=${traceContext.router_request_id} status=${status} duration_ms=${Date.now() - startedAt} error=${JSON.stringify(message)}`,
 			)
-			return buildErrorResponse(message, 400, traceContext.router_request_id)
+			return buildErrorResponse(message, status, traceContext.router_request_id)
 		}
 
 		try {
@@ -299,6 +329,7 @@ export function createApp() {
 					sessionId: traceContext.headers.resolved_session_id,
 					routerRequestId: traceContext.router_request_id,
 					userAgent: traceContext.headers.user_agent,
+					abortSignal: c.req.raw.signal,
 				}
 				const stream = createAnthropicStream(config, requestBody, codexContext, {
 					onSessionReady: async (metadata) => {
@@ -385,6 +416,7 @@ export function createApp() {
 				sessionId: traceContext.headers.resolved_session_id,
 				routerRequestId: traceContext.router_request_id,
 				userAgent: traceContext.headers.user_agent,
+				abortSignal: c.req.raw.signal,
 			})
 			const anthropicResponse = mapCodexResultToAnthropic(result, requestBody.model)
 			c.header('X-Router-Request-Id', traceContext.router_request_id)

@@ -30,6 +30,24 @@ const session = JSON.parse(rawSession) as AnthropicToolBridgeSession
 const toolCatalog = new Map(
 	session.tools.map((tool) => [normalizeToolName(tool.name), tool] as const),
 )
+const COMMAND_ALLOWLIST = new Set([
+	'git',
+	'rg',
+	'grep',
+	'findstr',
+	'Get-ChildItem',
+	'Get-Content',
+	'Select-String',
+	'pwd',
+	'echo',
+	'bun',
+	'node',
+	'python',
+	'pytest',
+	'npm',
+])
+let activeToolCalls = 0
+const toolCallWaiters: Array<() => void> = []
 
 function send(message: Record<string, unknown>) {
 	process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`)
@@ -45,7 +63,7 @@ function toAbsolutePath(inputPath: string | undefined): string {
 		return session.workspaceRoot
 	}
 
-	return isAbsolute(raw) ? resolve(raw) : resolve(session.workspaceRoot, raw)
+	return assertWorkspacePath(isAbsolute(raw) ? resolve(raw) : resolve(session.workspaceRoot, raw))
 }
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -56,6 +74,72 @@ function asObject(value: unknown): Record<string, unknown> {
 
 function asString(value: unknown): string | null {
 	return typeof value === 'string' ? value : null
+}
+
+function assertWorkspacePath(targetPath: string): string {
+	const normalizedWorkspace = resolve(session.workspaceRoot)
+	const normalizedTarget = resolve(targetPath)
+	if (
+		normalizedTarget !== normalizedWorkspace &&
+		!normalizedTarget.startsWith(`${normalizedWorkspace}\\`) &&
+		!normalizedTarget.startsWith(`${normalizedWorkspace}/`)
+	) {
+		throw new Error(`워크스페이스 외부 경로는 허용되지 않습니다: ${normalizedTarget}`)
+	}
+	return normalizedTarget
+}
+
+function validateArgumentsAgainstSchema(
+	toolName: string,
+	argumentsObject: Record<string, unknown>,
+): void {
+	const schema = toolCatalog.get(normalizeToolName(toolName))?.input_schema
+	if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+		return
+	}
+
+	const properties =
+		schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
+			? (schema.properties as Record<string, Record<string, unknown>>)
+			: {}
+	const required = Array.isArray(schema.required)
+		? schema.required.filter((value): value is string => typeof value === 'string')
+		: []
+	const additionalPropertiesAllowed = schema.additionalProperties !== false
+
+	for (const key of required) {
+		if (!(key in argumentsObject)) {
+			throw new Error(`필수 tool 인자가 없습니다: ${key}`)
+		}
+	}
+
+	for (const [key, value] of Object.entries(argumentsObject)) {
+		const propertySchema = properties[key]
+		if (!propertySchema) {
+			if (!additionalPropertiesAllowed) {
+				throw new Error(`허용되지 않은 tool 인자입니다: ${key}`)
+			}
+			continue
+		}
+
+		const expectedType = propertySchema.type
+		if (
+			expectedType === 'string' &&
+			typeof value !== 'string' &&
+			value !== null
+		) {
+			throw new Error(`tool 인자 '${key}' 는 string 이어야 합니다.`)
+		}
+		if (expectedType === 'number' && typeof value !== 'number') {
+			throw new Error(`tool 인자 '${key}' 는 number 이어야 합니다.`)
+		}
+		if (expectedType === 'boolean' && typeof value !== 'boolean') {
+			throw new Error(`tool 인자 '${key}' 는 boolean 이어야 합니다.`)
+		}
+		if (expectedType === 'object' && (!value || typeof value !== 'object' || Array.isArray(value))) {
+			throw new Error(`tool 인자 '${key}' 는 object 이어야 합니다.`)
+		}
+	}
 }
 
 function summarizeJson(value: unknown): string {
@@ -77,6 +161,32 @@ function fail(text: string): ToolCallResult {
 	return {
 		content: [{ type: 'text', text }],
 		isError: true,
+	}
+}
+
+function truncateOutput(text: string): string {
+	const encoded = new TextEncoder().encode(text)
+	if (encoded.byteLength <= session.maxResponseBytes) {
+		return text
+	}
+
+	const limited = new TextDecoder().decode(encoded.slice(0, session.maxResponseBytes))
+	return `${limited}\n...[truncated ${encoded.byteLength - session.maxResponseBytes} bytes]`
+}
+
+async function withToolSlot<T>(fn: () => Promise<T>): Promise<T> {
+	if (activeToolCalls >= session.maxConcurrentCalls) {
+		await new Promise<void>((resolve) => {
+			toolCallWaiters.push(resolve)
+		})
+	}
+
+	activeToolCalls += 1
+	try {
+		return await fn()
+	} finally {
+		activeToolCalls -= 1
+		toolCallWaiters.shift()?.()
 	}
 }
 
@@ -250,10 +360,11 @@ async function handleGrep(argumentsObject: Record<string, unknown>): Promise<Too
 
 async function runShellCommand(
 	command: string,
+	args: string[],
 	cwd: string,
 	timeoutMs: number,
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-	const processHandle = Bun.spawn(['powershell', '-NoLogo', '-NoProfile', '-Command', command], {
+	const processHandle = Bun.spawn([command, ...args], {
 		cwd,
 		stdout: 'pipe',
 		stderr: 'pipe',
@@ -279,14 +390,35 @@ async function runShellCommand(
 }
 
 async function handleBash(argumentsObject: Record<string, unknown>): Promise<ToolCallResult> {
-	const command = asString(argumentsObject.command)
-	if (!command) {
-		return fail('Bash 도구는 command 가 필요하다.')
+	const argv =
+		Array.isArray(argumentsObject.args) && argumentsObject.args.every((value) => typeof value === 'string')
+			? (argumentsObject.args as string[])
+			: null
+	const commandText = asString(argumentsObject.command)
+	const parts = argv ?? (commandText ? commandText.split(/\s+/).filter(Boolean) : [])
+	if (!parts.length) {
+		return fail('Bash 도구는 command 또는 args 가 필요하다.')
 	}
 
-	const timeoutMs = typeof argumentsObject.timeout === 'number' ? argumentsObject.timeout : 120000
-	const cwd = session.workspaceRoot
-	const result = await runShellCommand(command, cwd, timeoutMs)
+	if (parts.some((part) => /[;&|><`]/.test(part))) {
+		return fail('쉘 메타문자가 포함된 명령은 허용되지 않습니다.')
+	}
+
+	const command = parts[0]
+	if (!command) {
+		return fail('실행할 명령이 비어 있습니다.')
+	}
+	const args = parts.slice(1)
+	if (!COMMAND_ALLOWLIST.has(command)) {
+		return fail(`허용되지 않은 명령입니다: ${command}`)
+	}
+
+	const timeoutMs =
+		typeof argumentsObject.timeout === 'number'
+			? Math.min(argumentsObject.timeout, session.defaultTimeoutMs)
+			: session.defaultTimeoutMs
+	const cwd = toAbsolutePath(asString(argumentsObject.cwd) ?? session.workspaceRoot)
+	const result = await runShellCommand(command, args, cwd, timeoutMs)
 
 	const lines = [
 		`exit_code: ${result.exitCode}`,
@@ -416,34 +548,54 @@ function listTools() {
 }
 
 async function dispatchToolCall(toolName: string, argumentsObject: Record<string, unknown>): Promise<ToolCallResult> {
-	switch (normalizeToolName(toolName)) {
-		case 'read':
-		case 'read_file':
-			return handleRead(argumentsObject)
-		case 'glob':
-			return handleGlob(argumentsObject)
-		case 'grep':
-			return handleGrep(argumentsObject)
-		case 'bash':
-			return handleBash(argumentsObject)
-		case 'edit':
-			return handleEdit(argumentsObject)
-		case 'write':
-			return handleWrite(argumentsObject)
-		case 'toolsearch':
-			return handleToolSearch(argumentsObject)
-		case 'agent':
-		case 'skill':
-			return handleUnsupportedMetaTool(toolName, argumentsObject)
-		default: {
-			const known = toolCatalog.get(normalizeToolName(toolName))
-			return fail(
-				known
-					? `브리지에는 '${toolName}' schema 만 있고 실제 실행기는 없다.`
-					: `알 수 없는 도구: ${toolName}`,
-			)
+	return withToolSlot(async () => {
+		validateArgumentsAgainstSchema(toolName, argumentsObject)
+		let result: ToolCallResult
+		switch (normalizeToolName(toolName)) {
+			case 'read':
+			case 'read_file':
+				result = await handleRead(argumentsObject)
+				break
+			case 'glob':
+				result = await handleGlob(argumentsObject)
+				break
+			case 'grep':
+				result = await handleGrep(argumentsObject)
+				break
+			case 'bash':
+				result = await handleBash(argumentsObject)
+				break
+			case 'edit':
+				result = await handleEdit(argumentsObject)
+				break
+			case 'write':
+				result = await handleWrite(argumentsObject)
+				break
+			case 'toolsearch':
+				result = handleToolSearch(argumentsObject)
+				break
+			case 'agent':
+			case 'skill':
+				result = handleUnsupportedMetaTool(toolName, argumentsObject)
+				break
+			default: {
+				const known = toolCatalog.get(normalizeToolName(toolName))
+				result = fail(
+					known
+						? `브리지에는 '${toolName}' schema 만 있고 실제 실행기는 없다.`
+						: `알 수 없는 도구: ${toolName}`,
+				)
+			}
 		}
-	}
+
+		return {
+			...result,
+			content: result.content.map((item) => ({
+				...item,
+				text: truncateOutput(item.text),
+			})),
+		}
+	})
 }
 
 process.stdin.setEncoding('utf8')

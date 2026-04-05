@@ -8,6 +8,7 @@ import type {
 	CodexThreadMode,
 	CodexThreadReuseReason,
 } from '../shared/index.js'
+import { redactSensitiveValue } from './request-capture.js'
 
 export interface RouterTraceContext {
 	router_request_id: string
@@ -148,11 +149,11 @@ export function buildRouterTraceContext(input: {
 
 async function appendJsonLine(path: string, value: unknown) {
 	await mkdir(dirname(path), { recursive: true })
-	await appendFile(path, `${JSON.stringify(value)}\n`, 'utf8')
+	await appendFile(path, `${JSON.stringify(redactSensitiveValue(value))}\n`, 'utf8')
 }
 
 export function logRouterLine(message: string) {
-	console.log(`[router] ${new Date().toISOString()} ${message}`)
+	process.stdout.write(`[router] ${new Date().toISOString()} ${message}\n`)
 }
 
 export async function captureRouterResponse(

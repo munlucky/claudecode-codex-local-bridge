@@ -191,4 +191,12 @@ export interface RouterHealthResponse {
 	codex_auth_file: string
 	has_local_auth_file: boolean
 	has_auth_mode_dependency: boolean
+	live?: boolean
+	readiness?: 'ready' | 'degraded'
+	queue_depth?: number
+	active_session_count?: number
+	pending_session_creates?: number
+	recent_retryable_failures?: number
+	recent_non_retryable_failures?: number
+	recent_retries?: number
 }

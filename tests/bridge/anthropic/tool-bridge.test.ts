@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createAnthropicToolBridge } from '../../../src/bridge/anthropic/index.js'
+import { validateAnthropicToolDefinitions } from '../../../src/bridge/anthropic/tool-bridge.js'
 
 describe('createAnthropicToolBridge', () => {
 	test('creates MCP config override when Anthropic tools are present', async () => {
@@ -17,6 +18,7 @@ describe('createAnthropicToolBridge', () => {
 							properties: {
 								file_path: { type: 'string' },
 							},
+							additionalProperties: false,
 						},
 					},
 				],
@@ -29,5 +31,40 @@ describe('createAnthropicToolBridge', () => {
 		expect(bridge?.configOverride).toHaveProperty('mcp_servers')
 
 		await bridge?.cleanup()
+	})
+
+	test('rejects duplicate or non-strict tool definitions', () => {
+		expect(() =>
+			validateAnthropicToolDefinitions([
+				{
+					name: 'Read',
+					input_schema: {
+						type: 'object',
+						properties: { file_path: { type: 'string' } },
+						additionalProperties: false,
+					},
+				},
+				{
+					name: 'read',
+					input_schema: {
+						type: 'object',
+						properties: {},
+						additionalProperties: false,
+					},
+				},
+			]),
+		).toThrow('중복된 tool 이름')
+
+		expect(() =>
+			validateAnthropicToolDefinitions([
+				{
+					name: 'Read',
+					input_schema: {
+						type: 'object',
+						properties: { file_path: { type: 'string' } },
+					},
+				},
+			]),
+		).toThrow('additionalProperties')
 	})
 })

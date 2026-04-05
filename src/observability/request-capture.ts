@@ -1,6 +1,6 @@
 import { buildAnonymousConversationSeed } from '../bridge/anthropic/index.js'
-import { appendFile, mkdir } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { appendFile, mkdir, readdir, rename, stat, unlink } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import type { RouterConfig } from '../server/index.js'
 import type { AnthropicMessagesRequest } from '../shared/index.js'
 import type { RouterTraceContext } from './router-trace.js'
@@ -22,6 +22,65 @@ type CapturedAnthropicRequest = {
 	tools: unknown
 	anonymous_conversation_seed: string | null
 	body_parse_error?: string
+}
+
+const SECRET_KEY_PATTERN = /(api[_-]?key|token|authorization|password|secret|cookie)/i
+const ABSOLUTE_PATH_PATTERN =
+	/([A-Za-z]:\\[^"'`\s]+|\/(?:Users|home|tmp|var|opt|etc|mnt|srv)\/[^"'`\s]+)/g
+
+export function redactSensitiveValue(value: unknown): unknown {
+	if (typeof value === 'string') {
+		return value
+			.replace(/(sk-[A-Za-z0-9_-]{8,})/g, '[REDACTED_TOKEN]')
+			.replace(/(Bearer\s+)[^\s]+/gi, '$1[REDACTED_TOKEN]')
+			.replace(ABSOLUTE_PATH_PATTERN, '[REDACTED_PATH]')
+	}
+
+	if (Array.isArray(value)) {
+		return value.map((item) => redactSensitiveValue(item))
+	}
+
+	if (!value || typeof value !== 'object') {
+		return value
+	}
+
+	const object = value as Record<string, unknown>
+	return Object.fromEntries(
+		Object.entries(object).map(([key, entryValue]) => [
+			key,
+			SECRET_KEY_PATTERN.test(key) ? '[REDACTED]' : redactSensitiveValue(entryValue),
+		]),
+	)
+}
+
+async function enforceCapturePolicy(path: string, maxFileBytes: number, retentionDays: number) {
+	await mkdir(dirname(path), { recursive: true })
+	const existing = await stat(path).catch(() => null)
+	if (existing && maxFileBytes > 0 && existing.size >= maxFileBytes) {
+		const rotatedPath = join(
+			dirname(path),
+			`${basename(path, '.jsonl')}.${Date.now()}.jsonl`,
+		)
+		await rename(path, rotatedPath).catch(() => undefined)
+	}
+
+	if (retentionDays <= 0) {
+		return
+	}
+
+	const cutoffMs = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+	const directoryEntries = await readdir(dirname(path), { withFileTypes: true }).catch(() => [])
+	for (const entry of directoryEntries) {
+		if (!entry.isFile() || !entry.name.startsWith(basename(path, '.jsonl'))) {
+			continue
+		}
+
+		const entryPath = join(dirname(path), entry.name)
+		const entryStat = await stat(entryPath).catch(() => null)
+		if (entryStat && entryStat.mtimeMs < cutoffMs) {
+			await unlink(entryPath).catch(() => undefined)
+		}
+	}
 }
 
 function toCapturedRecord(
@@ -54,14 +113,14 @@ function toCapturedRecord(
 		path: context.path,
 		started_at: context.started_at,
 		header_names: context.header_names,
-		headers: context.headers,
+		headers: redactSensitiveValue(context.headers) as RouterTraceContext['headers'],
 		model: context.model,
 		stream: context.stream,
 		message_count: context.message_count,
 		tool_count: context.tool_count,
 		tool_names: toolNames.length ? toolNames : context.tool_names,
-		tool_choice: payload.tool_choice ?? null,
-		tools,
+		tool_choice: redactSensitiveValue(payload.tool_choice ?? null),
+		tools: redactSensitiveValue(tools),
 		anonymous_conversation_seed: typedRequest
 			? buildAnonymousConversationSeed(typedRequest)
 			: null,
@@ -96,16 +155,20 @@ export async function captureAnthropicRequest(
 	}
 
 	const record = toCapturedRecord(input.traceContext, body, parseError)
-	await mkdir(dirname(config.captureRequestsPath), { recursive: true })
+	await enforceCapturePolicy(
+		config.captureRequestsPath,
+		config.captureMaxFileBytes,
+		config.captureRetentionDays,
+	)
 	await appendFile(
 		config.captureRequestsPath,
-		`${JSON.stringify(record)}\n`,
+		`${JSON.stringify(redactSensitiveValue(record))}\n`,
 		'utf8',
 	)
 
 	if ((body as { tools?: unknown[] }).tools?.length) {
-		console.log(
-			`[router] ${new Date().toISOString()} captured request_id=${record.router_request_id} tools=${JSON.stringify(record.tool_names)} path=${config.captureRequestsPath}`,
+		process.stdout.write(
+			`[router] ${new Date().toISOString()} captured request_id=${record.router_request_id} tools=${JSON.stringify(record.tool_names)} path=${config.captureRequestsPath}\n`,
 		)
 	}
 }

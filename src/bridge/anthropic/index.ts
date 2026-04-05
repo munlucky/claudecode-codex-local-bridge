@@ -1,4 +1,5 @@
 export {
+	AnthropicRequestValidationError,
 	buildAnonymousConversationSeed,
 	buildCodexDeveloperInstructions,
 	buildCodexPromptMetrics,
@@ -11,6 +12,7 @@ export {
 	parseCodexBridgeDecision,
 	resolveModelAlias,
 	serializeAnthropicRequestToCodexPrompt,
+	validateAnthropicRequestSemantics,
 } from './compat.js'
 export { createAnthropicToolBridge } from './tool-bridge.js'
 export type {

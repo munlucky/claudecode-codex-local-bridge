@@ -66,6 +66,7 @@ ANTHROPIC_API_KEY=
 ```
 
 브리지는 inbound Anthropic 토큰을 검증하지 않고, 실제 upstream 인증은 로컬 Codex 세션으로 처리합니다.
+반드시 `127.0.0.1` 또는 로컬 전용 인터페이스에만 바인딩해야 합니다.
 
 ## 설정
 
@@ -85,6 +86,8 @@ ANTHROPIC_API_KEY=
 | `CODEX_TURN_TIMEOUT_MS` | `180000` | Codex 한 턴 최대 실행 시간 |
 | `CODEX_TURN_REQUEST_TIMEOUT_MS` | `180000` | `turn/start` 요청만의 타임아웃 |
 | `ROUTER_IDLE_TIMEOUT_SEC` | `185` | SSE 유휴 타임아웃 |
+| `ROUTER_CAPTURE_MAX_FILE_BYTES` | `5242880` | 캡처 파일 rotate 기준 크기(byte) |
+| `ROUTER_CAPTURE_RETENTION_DAYS` | `7` | 캡처 파일 보존 일수 |
 | `MODEL_ALIASES_JSON` | 미설정 | Anthropic 모델 ID와 Codex 모델 매핑 덮어쓰기 |
 
 디버그 로그와 요청/응답 캡처는 기본적으로 활성화되어 있습니다. `.history/` 아래에 로컬 추적 파일을 남기고 싶지 않다면 다음 값을 끄면 됩니다.
@@ -94,6 +97,8 @@ ROUTER_LOG_REQUESTS=0
 ROUTER_CAPTURE_REQUESTS=0
 ROUTER_CAPTURE_RESPONSES=0
 ```
+
+캡처를 켜 두면 `.history/*.jsonl`은 기본적으로 5MB 초과 시 rotate 되며 7일이 지난 파일은 정리됩니다.
 
 ### 토큰 분석 로그
 
@@ -145,7 +150,15 @@ jq -r '
   "codex_runtime_cwd": "/Users/me/.codex/bridge-runtime",
   "codex_auth_file": "/Users/me/.codex/auth.json",
   "has_local_auth_file": true,
-  "has_auth_mode_dependency": true
+  "has_auth_mode_dependency": true,
+  "live": true,
+  "readiness": "ready",
+  "queue_depth": 0,
+  "active_session_count": 0,
+  "pending_session_creates": 0,
+  "recent_retryable_failures": 0,
+  "recent_non_retryable_failures": 0,
+  "recent_retries": 0
 }
 ```
 
@@ -155,6 +168,12 @@ jq -r '
 - `api_key`: `CODEX_OPENAI_API_KEY` 또는 `OPENAI_API_KEY` 존재 여부
 - `account`: `account/read` 또는 구버전 `getAuthStatus` 호출로 실제 인증 존재 여부 판정
 - `disabled`: `true`
+
+추가 health 필드:
+- `live`: 프로세스 생존 여부
+- `readiness`: 현재 인증/런타임 준비 상태
+- `queue_depth`, `active_session_count`, `pending_session_creates`: 세션 캐시와 대기 상태
+- `recent_retryable_failures`, `recent_non_retryable_failures`, `recent_retries`: 최근 브리지 실패/재시도 카운터
 
 `/health`는 위 항목이 `false`이면 503(서비스 점검)으로 반환됩니다.  
 `local_auth_json`에서 인증 파일이 없으면 시작 로그에 경고가 기록됩니다.
@@ -216,12 +235,17 @@ dist/
 ## 제한 사항
 
 - 로컬 사용 전제입니다. 외부 인터넷에 직접 노출하면 안 됩니다.
+- inbound bearer token은 검증하지 않으므로 reverse proxy 없이 외부 바인딩하면 안 됩니다.
 - `codex app-server`의 로컬 프로토콜에 의존하며, 공개 안정 API 계약이 아닙니다.
 - 인증은 Codex app-server 세션 기준이며 `local_auth_json`/`account`/`api_key` 모드를 지원합니다.
 - Inbound Anthropic bearer token은 검증하지 않습니다.
 - `x-claude-code-session-id`가 있으면 동일 workspace 안에서 Codex app-server 세션과 thread를 재사용합니다.
 - 구버전 Claude Code처럼 session header가 없는 경우에는 동일 workspace + 동일 CLI user agent + 요청에서 추출한 대화 seed에 대해 짧은 TTL 기반 fallback 재사용을 시도합니다.
 - 재사용된 thread가 더 이상 유효하지 않으면 같은 세션에서 새 thread를 다시 만들고, 세션 자체가 깨졌으면 캐시 세션을 교체합니다.
+
+## 운영 런북
+
+운영/장애 대응 절차는 [docs/runbook.md](./docs/runbook.md)를 참고합니다.
 
 ## 개발
 

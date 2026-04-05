@@ -45,4 +45,14 @@ describe('loadConfig', () => {
 
 		expect(config.codexAuthMode).toBe('disabled')
 	})
+
+	test('sets capture policy defaults', () => {
+		delete process.env.ROUTER_CAPTURE_MAX_FILE_BYTES
+		delete process.env.ROUTER_CAPTURE_RETENTION_DAYS
+
+		const config = loadConfig()
+
+		expect(config.captureMaxFileBytes).toBe(5 * 1024 * 1024)
+		expect(config.captureRetentionDays).toBe(7)
+	})
 })

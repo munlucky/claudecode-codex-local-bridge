@@ -20,6 +20,8 @@ export interface RouterConfig {
 	captureRequestsPath: string
 	captureResponses: boolean
 	captureResponsesPath: string
+	captureMaxFileBytes: number
+	captureRetentionDays: number
 	heartbeatIntervalSec: number
 	modelAliases: Record<string, string>
 }
@@ -61,6 +63,11 @@ function parseBoolean(value: string | undefined, fallback: boolean): boolean {
 }
 
 function parseHeartbeatSeconds(value: string | undefined, fallback: number): number {
+	const parsed = Number.parseInt(value ?? '', 10)
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+}
+
+function parseNonNegativeInteger(value: string | undefined, fallback: number): number {
 	const parsed = Number.parseInt(value ?? '', 10)
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
 }
@@ -170,6 +177,14 @@ export function loadConfig(): RouterConfig {
 		captureResponsesPath: expandHomePath(
 			process.env.ROUTER_CAPTURE_RESPONSES_PATH?.trim() ||
 				'.history/anthropic-responses.jsonl',
+		),
+		captureMaxFileBytes: parseNonNegativeInteger(
+			process.env.ROUTER_CAPTURE_MAX_FILE_BYTES,
+			5 * 1024 * 1024,
+		),
+		captureRetentionDays: parseNonNegativeInteger(
+			process.env.ROUTER_CAPTURE_RETENTION_DAYS,
+			7,
 		),
 		heartbeatIntervalSec: parseHeartbeatSeconds(
 			process.env.ROUTER_HEARTBEAT_INTERVAL_SEC,

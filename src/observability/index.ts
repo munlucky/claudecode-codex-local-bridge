@@ -1,4 +1,4 @@
-export { captureAnthropicRequest } from './request-capture.js'
+export { captureAnthropicRequest, redactSensitiveValue } from './request-capture.js'
 export {
 	buildRouterTraceContext,
 	captureRouterResponse,

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { buildRouterTraceContext } from '../../src/observability/index.js'
+import { buildRouterTraceContext, redactSensitiveValue } from '../../src/observability/index.js'
 
 describe('buildRouterTraceContext', () => {
 	test('uses upstream request id when present', () => {
@@ -87,5 +87,19 @@ describe('buildRouterTraceContext', () => {
 		expect(context.headers.x_claude_code_session_id).toBeNull()
 		expect(context.headers.x_bridge_session_id).toBe('bridge-only-session')
 		expect(context.headers.resolved_session_id).toBe('bridge-only-session')
+	})
+
+	test('redacts secrets and absolute paths from captured payloads', () => {
+		const sanitized = redactSensitiveValue({
+			authorization: 'Bearer secret-token-value',
+			file_path: 'C:\\dev\\secret\\token.txt',
+			nested: {
+				api_key: 'sk-test-123456789',
+			},
+		}) as Record<string, unknown>
+
+		expect(sanitized.authorization).toBe('[REDACTED]')
+		expect(sanitized.file_path).toBe('[REDACTED_PATH]')
+		expect((sanitized.nested as Record<string, unknown>).api_key).toBe('[REDACTED]')
 	})
 })

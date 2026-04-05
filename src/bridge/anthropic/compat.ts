@@ -12,6 +12,16 @@ import type {
 } from '../../shared/index.js'
 import type { RouterConfig } from '../../server/index.js'
 
+export class AnthropicRequestValidationError extends Error {
+	readonly statusCode: number
+
+	constructor(message: string, statusCode = 422) {
+		super(message)
+		this.name = 'AnthropicRequestValidationError'
+		this.statusCode = statusCode
+	}
+}
+
 type ToolMappingRule = {
 	match: (name: string) => boolean
 	describe: (toolName: string) => string
@@ -831,5 +841,88 @@ export function mapCodexResultToAnthropic(
 		stop_reason: 'end_turn',
 		stop_sequence: null,
 		usage,
+	}
+}
+
+function isToolSchemaStrict(schema: unknown): boolean {
+	const object = schema && typeof schema === 'object' && !Array.isArray(schema)
+		? (schema as Record<string, unknown>)
+		: null
+	if (!object) {
+		return false
+	}
+
+	return object.type === 'object' && object.additionalProperties === false
+}
+
+export function validateAnthropicRequestSemantics(request: AnthropicMessagesRequest): void {
+	const seenToolIds = new Set<string>()
+	const availableTools = new Set((request.tools ?? []).map((tool) => tool.name))
+	const pendingToolIds = new Set<string>()
+
+	for (const tool of request.tools ?? []) {
+		if (!tool.name.trim()) {
+			throw new AnthropicRequestValidationError('tool.name 은 비어 있을 수 없습니다.', 400)
+		}
+		if (!isToolSchemaStrict(tool.input_schema)) {
+			throw new AnthropicRequestValidationError(
+				`tool '${tool.name}' input_schema 는 strict object schema(type=object, additionalProperties=false)여야 합니다.`,
+				400,
+			)
+		}
+	}
+
+	for (const block of toContentBlocks(request.system)) {
+		if (block.type === 'tool_use' || block.type === 'tool_result') {
+			throw new AnthropicRequestValidationError(
+				'system 블록에는 tool_use/tool_result를 포함할 수 없습니다.',
+				422,
+			)
+		}
+	}
+
+	for (const message of request.messages) {
+		const blocks = toContentBlocks(message.content)
+		for (const block of blocks) {
+			if (block.type === 'tool_use') {
+				if (message.role !== 'assistant') {
+					throw new AnthropicRequestValidationError(
+						'tool_use 블록은 assistant 메시지에서만 허용됩니다.',
+						422,
+					)
+				}
+				if (!availableTools.has(block.name)) {
+					throw new AnthropicRequestValidationError(
+						`정의되지 않은 tool_use 이름입니다: ${block.name}`,
+						422,
+					)
+				}
+				if (seenToolIds.has(block.id)) {
+					throw new AnthropicRequestValidationError(
+						`중복된 tool_use id 입니다: ${block.id}`,
+						422,
+					)
+				}
+				seenToolIds.add(block.id)
+				pendingToolIds.add(block.id)
+				continue
+			}
+
+			if (block.type === 'tool_result') {
+				if (message.role !== 'user') {
+					throw new AnthropicRequestValidationError(
+						'tool_result 블록은 user 메시지에서만 허용됩니다.',
+						422,
+					)
+				}
+				if (!pendingToolIds.has(block.tool_use_id)) {
+					throw new AnthropicRequestValidationError(
+						`선행 tool_use 없이 tool_result 가 전달되었습니다: ${block.tool_use_id}`,
+						422,
+					)
+				}
+				pendingToolIds.delete(block.tool_use_id)
+			}
+		}
 	}
 }

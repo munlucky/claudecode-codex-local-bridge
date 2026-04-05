@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { loadConfig } from '../../../src/server/index.js'
 import {
+	AnthropicRequestValidationError,
 	buildAnonymousConversationSeed,
 	buildCodexDeveloperInstructions,
 	buildToolMappingGuidance,
@@ -10,6 +11,7 @@ import {
 	parseCodexBridgeDecision,
 	resolveModelAlias,
 	serializeAnthropicRequestToCodexPrompt,
+	validateAnthropicRequestSemantics,
 } from '../../../src/bridge/anthropic/index.js'
 
 describe('Anthropic/Codex mapping', () => {
@@ -340,5 +342,50 @@ describe('Anthropic/Codex mapping', () => {
 		})
 
 		expect(seedLater).toBe(seedInitial)
+	})
+
+	test('rejects tool_result without a prior tool_use', () => {
+		expect(() =>
+			validateAnthropicRequestSemantics({
+				model: 'claude-sonnet-4-5-20250929',
+				max_tokens: 128,
+				messages: [
+					{
+						role: 'user',
+						content: [{ type: 'tool_result', tool_use_id: 'toolu_missing', content: 'x' }],
+					},
+				],
+				tools: [
+					{
+						name: 'Read',
+						input_schema: {
+							type: 'object',
+							properties: { file_path: { type: 'string' } },
+							required: ['file_path'],
+							additionalProperties: false,
+						},
+					},
+				],
+			}),
+		).toThrow(AnthropicRequestValidationError)
+	})
+
+	test('rejects non-strict tool schemas', () => {
+		expect(() =>
+			validateAnthropicRequestSemantics({
+				model: 'claude-sonnet-4-5-20250929',
+				max_tokens: 128,
+				messages: [{ role: 'user', content: 'hello' }],
+				tools: [
+					{
+						name: 'Read',
+						input_schema: {
+							type: 'object',
+							properties: { file_path: { type: 'string' } },
+						},
+					},
+				],
+			}),
+		).toThrow('strict object schema')
 	})
 })
