@@ -57,4 +57,40 @@ describe('runtime-log', () => {
 		expect(requestTrace).toContain('"_channel":"03-anthropic-responses"')
 		expect(latestPointer.trim()).toBe(info!.runDir)
 	})
+
+	test('writes backend-specific session metadata only for the active backend', async () => {
+		const restoreBackend = process.env.BRIDGE_BACKEND
+		const restoreOllamaBaseUrl = process.env.OLLAMA_BASE_URL
+		const restoreOllamaModel = process.env.OLLAMA_MODEL
+
+		process.env.BRIDGE_BACKEND = 'ollama'
+		process.env.OLLAMA_BASE_URL = 'http://127.0.0.1:11434'
+		process.env.OLLAMA_MODEL = 'qwen3.5:27b'
+
+		const ollamaConfig = loadConfig()
+		const ollamaInfo = getRuntimeLogInfo(ollamaConfig)
+		await ensureRuntimeLogSession(ollamaConfig)
+		const ollamaSession = await readFile(join(ollamaInfo!.runDir, '00-session.json'), 'utf8')
+
+		expect(ollamaSession).toContain('"backend": "ollama"')
+		expect(ollamaSession).toContain('"ollama_base_url": "http://127.0.0.1:11434"')
+		expect(ollamaSession).not.toContain('"codex_auth_file"')
+		expect(ollamaSession).not.toContain('"codex_runtime_cwd"')
+
+		if (restoreBackend === undefined) {
+			delete process.env.BRIDGE_BACKEND
+		} else {
+			process.env.BRIDGE_BACKEND = restoreBackend
+		}
+		if (restoreOllamaBaseUrl === undefined) {
+			delete process.env.OLLAMA_BASE_URL
+		} else {
+			process.env.OLLAMA_BASE_URL = restoreOllamaBaseUrl
+		}
+		if (restoreOllamaModel === undefined) {
+			delete process.env.OLLAMA_MODEL
+		} else {
+			process.env.OLLAMA_MODEL = restoreOllamaModel
+		}
+	})
 })

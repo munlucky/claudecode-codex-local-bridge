@@ -169,6 +169,62 @@ describe('Ollama provider mapping', () => {
 		expect((sentBody as { model: string }).model).toBe('qwen3.5:27b')
 	})
 
+	test('does not reuse CODEX model aliases when resolving Ollama requests', async () => {
+		const originalCodeModel = process.env.CODEX_MODEL_SONNET
+		process.env.CODEX_MODEL_SONNET = 'gpt-5.4'
+
+		let sentBody: unknown = null
+		global.fetch = async (input, init) => {
+			if (String(input).includes('/api/chat')) {
+				sentBody = init?.body ? JSON.parse(String(init.body)) : null
+				return Response.json(fixtureChatResponse)
+			}
+			throw new Error('unexpected endpoint')
+		}
+
+		try {
+			await runOllamaTurn(createOllamaConfig(), {
+				model: 'claude-sonnet-4-5-20250929',
+				max_tokens: 128,
+				messages: [{ role: 'user', content: '짧게 자기소개' }],
+			})
+		} finally {
+			if (originalCodeModel === undefined) {
+				delete process.env.CODEX_MODEL_SONNET
+			} else {
+				process.env.CODEX_MODEL_SONNET = originalCodeModel
+			}
+		}
+
+		expect((sentBody as { model: string }).model).toBe('qwen3.5:27b')
+	})
+
+	test('uses OLLAMA model aliases independently from CODEX aliases', async () => {
+		let sentBody: unknown = null
+		global.fetch = async (input, init) => {
+			if (String(input).includes('/api/chat')) {
+				sentBody = init?.body ? JSON.parse(String(init.body)) : null
+				return Response.json(fixtureChatResponse)
+			}
+			throw new Error('unexpected endpoint')
+		}
+
+		await runOllamaTurn(
+			createOllamaConfig({
+				ollamaModelAliases: {
+					'claude-sonnet-4-5-20250929': 'qwen3.5:32b',
+				},
+			}),
+			{
+				model: 'claude-sonnet-4-5-20250929',
+				max_tokens: 128,
+				messages: [{ role: 'user', content: '짧게 자기소개' }],
+			},
+		)
+
+		expect((sentBody as { model: string }).model).toBe('qwen3.5:32b')
+	})
+
 	test('maps tool_calls into Anthropic tool_use blocks when request has tools', async () => {
 		global.fetch = async (input) => {
 			if (String(input).includes('/api/chat')) {

@@ -493,7 +493,6 @@ function buildHealthPayload(
 			recent_non_retryable_failures: codexSnapshot.recentNonRetryableFailures,
 			recent_retries: codexSnapshot.recentRetries,
 			codex_model: config.modelAliases?.['claude-sonnet-4-5-20250929'],
-			has_ollama_api_key: Boolean(config.ollamaApiKey),
 			auth_message: authDependencyMessage,
 		}
 	}
@@ -501,8 +500,6 @@ function buildHealthPayload(
 	return {
 		status: 'ok',
 		backend: 'ollama_api',
-		auth_mode: config.codexAuthMode,
-		has_auth_mode_dependency: hasAuthDependency,
 		live: true,
 		readiness: healthReady ? 'ready' : 'degraded',
 		ollama_base_url: config.ollamaBaseUrl,

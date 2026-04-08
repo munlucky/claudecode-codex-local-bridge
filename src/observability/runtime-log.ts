@@ -91,9 +91,18 @@ export async function ensureRuntimeLogSession(config: RouterConfig) {
 		listen_host: config.listenHost,
 		listen_port: config.listenPort,
 		backend: config.bridgeBackend,
-		ollama_base_url: config.ollamaBaseUrl,
-		ollama_model: config.ollamaModel,
-		ollama_request_timeout_ms: config.ollamaRequestTimeoutMs,
+		...(config.bridgeBackend === 'codex'
+			? {
+					codex_command: config.codexCommand,
+					codex_auth_mode: config.codexAuthMode,
+					codex_auth_file: config.codexAuthFile,
+					codex_runtime_cwd: config.codexRuntimeCwd,
+				}
+			: {
+					ollama_base_url: config.ollamaBaseUrl,
+					ollama_model: config.ollamaModel,
+					ollama_request_timeout_ms: config.ollamaRequestTimeoutMs,
+				}),
 		capture_requests_path: config.captureRequestsPath,
 		capture_responses_path: config.captureResponsesPath,
 		root_dir: state.rootDir,

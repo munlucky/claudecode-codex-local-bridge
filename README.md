@@ -120,6 +120,7 @@ node scripts/verify-ollama-bridge.mjs --base http://127.0.0.1:3000 --model qwen3
 | `OLLAMA_API_KEY` | 미설정 | Ollama 인증키 (필요 시) |
 | `OLLAMA_REQUEST_TIMEOUT_MS` | `120000` | Ollama 요청 타임아웃(ms) |
 | `OLLAMA_SHOW_THINKING` | `0` | `message.thinking` 응답 포함 여부 (`1`이면 포함) |
+| `OLLAMA_MODEL_ALIASES_JSON` | 미설정 | Anthropic/Ollama 요청 모델명과 실제 Ollama 모델명 매핑 |
 | `MODEL_ALIASES_JSON` | 미설정 | Anthropic 모델 ID와 Codex 모델 매핑 덮어쓰기 |
 
 디버그 로그와 요청/응답 캡처는 기본적으로 활성화되어 있습니다. `.history/` 아래에 로컬 추적 파일을 남기고 싶지 않다면 다음 값을 끄면 됩니다.
@@ -169,7 +170,7 @@ jq -r '
 
 ### `GET /health`
 
-런타임 상태, 인증 모드, 실행 명령, 인증 준비 의존성 상태를 반환합니다.
+런타임 상태를 반환합니다. 응답 필드는 활성 backend에 맞춰 분리됩니다.
 
 응답 예시(예: `/health`):
 
@@ -194,6 +195,8 @@ jq -r '
 }
 ```
 
+Codex backend에서만:
+
 `has_local_auth_file`는 `CODEX_AUTH_FILE` 존재 여부만 나타내며,  
 `has_auth_mode_dependency`는 현재 `CODEX_AUTH_MODE` 기준으로 실제 인증 선행 조건 충족 여부를 의미합니다.
 - `local_auth_json`: 인증 파일 존재 여부
@@ -201,11 +204,13 @@ jq -r '
 - `account`: `account/read` 또는 구버전 `getAuthStatus` 호출로 실제 인증 존재 여부 판정
 - `disabled`: `true`
 
-추가 health 필드:
+Codex 추가 health 필드:
 - `live`: 프로세스 생존 여부
 - `readiness`: 현재 인증/런타임 준비 상태
 - `queue_depth`, `active_session_count`, `pending_session_creates`: 세션 캐시와 대기 상태
 - `recent_retryable_failures`, `recent_non_retryable_failures`, `recent_retries`: 최근 브리지 실패/재시도 카운터
+
+Ollama backend에서는 `ollama_base_url`, `ollama_model`, `has_ollama_api_key`, `live`, `readiness`만 반환합니다.
 
 `/health`는 위 항목이 `false`이면 503(서비스 점검)으로 반환됩니다.  
 `local_auth_json`에서 인증 파일이 없으면 시작 로그에 경고가 기록됩니다.

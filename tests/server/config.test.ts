@@ -106,6 +106,7 @@ describe('loadConfig', () => {
 			OLLAMA_MODEL: 'qwen3.5:27b',
 			OLLAMA_REQUEST_TIMEOUT_MS: '45000',
 			OLLAMA_SHOW_THINKING: '1',
+			OLLAMA_MODEL_ALIASES_JSON: '{"claude-sonnet-4-5-20250929":"qwen3.5:27b"}',
 		})
 
 		const config = loadConfig()
@@ -115,6 +116,7 @@ describe('loadConfig', () => {
 		expect(config.ollamaModel).toBe('qwen3.5:27b')
 		expect(config.ollamaRequestTimeoutMs).toBe(45000)
 		expect(config.ollamaShowThinking).toBe(true)
+		expect(config.ollamaModelAliases['claude-sonnet-4-5-20250929']).toBe('qwen3.5:27b')
 		restore()
 	})
 })

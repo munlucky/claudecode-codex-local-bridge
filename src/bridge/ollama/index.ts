@@ -430,8 +430,16 @@ function resolveModel(config: RouterConfig, requestedModel: string): string {
 		return trimmed
 	}
 
-	const aliased = config.modelAliases[trimmed]
-	return aliased ?? config.ollamaModel
+	const aliased = config.ollamaModelAliases[trimmed]
+	if (aliased) {
+		return aliased
+	}
+
+	if (trimmed.startsWith('claude-')) {
+		return config.ollamaModel
+	}
+
+	return config.ollamaModel
 }
 
 export async function listOllamaModels(

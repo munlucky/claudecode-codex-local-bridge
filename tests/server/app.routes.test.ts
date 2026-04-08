@@ -73,6 +73,10 @@ describe('Ollama router integration', () => {
 			expect(payload.backend).toBe('ollama_api')
 			expect(payload.ollama_base_url).toBe('http://127.0.0.1:11434')
 			expect(payload.ollama_model).toBe('qwen3.5:27b')
+			expect(payload).not.toHaveProperty('auth_mode')
+			expect(payload).not.toHaveProperty('has_auth_mode_dependency')
+			expect(payload).not.toHaveProperty('codex_auth_file')
+			expect(payload).not.toHaveProperty('codex_runtime_cwd')
 		} finally {
 			restore()
 		}
