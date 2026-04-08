@@ -178,7 +178,7 @@ function summarizeJsonValue(value: unknown, limit = 280): string {
 
 function normalizeInputSchemaToStrictObject(
 	toolName: string,
-	inputSchema: AnthropicMessagesRequest['tools'][number]['input_schema'],
+	inputSchema: NonNullable<AnthropicMessagesRequest['tools']>[number]['input_schema'],
 ): void {
 	if (!isPlainObject(inputSchema)) {
 		throw new AnthropicRequestValidationError(
